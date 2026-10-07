@@ -7,7 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **AppConfig — gradual rollout and alarm rollback** — deployments completed the moment they started; they now walk `DEPLOYING` → `BAKING` → `COMPLETE` over their strategy, in `LINEAR` or `EXPONENTIAL` (G×2^N) steps spread over `DeploymentDurationInMinutes`, then bake for `FinalBakeTimeInMinutes`, reporting `PercentageComplete`, the `EventLog` (most recent first) and the environment `State`. A CloudWatch alarm in the environment's `Monitors` that enters `ALARM` before the bake ends rolls the deployment back, even if it recovered before anyone looked. A second deployment to an environment with one in progress, or a stale `LatestDeploymentNumber`, answers `ConflictException`. During a rollout each configuration session gets the new version once `PercentageComplete` covers its fixed slot, so a fleet of AppConfig Agent sidecars splits the way a canary should. `APPCONFIG_DEPLOYMENT_MINUTE_SECONDS` (default `0`, deployments complete as they start; `60` is AWS's pace; also settable through `/_ministack/config`) sets how long a strategy minute lasts.
+
 ### Fixed
+
+- **AppConfig — `GetLatestConfiguration` returns an empty body when the client already has the latest version** — it returned the full configuration on every poll, so a client that mishandled AWS's empty response passed locally. It now also returns `Version-Label` and honors `RequiredMinimumPollIntervalInSeconds` as the session's `Next-Poll-Interval-In-Seconds`; `CreateHostedConfigurationVersion` keeps `VersionLabel`.
+- **AppConfig — `StopDeployment` follows its documented states** — it marked any deployment `ROLLED_BACK`. An in-progress deployment is rolled back; a completed one needs `AllowRevert` and becomes `REVERTED` (within 72 hours of completing), so sessions are served the previous version again; anything else answers `BadRequestException`.
 
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
