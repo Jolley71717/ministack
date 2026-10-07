@@ -1043,6 +1043,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "logs":
+        action = headers.get("x-amz-target", "").rsplit(".", 1)[-1]
+        if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+            return _safe_json_field(body, "resourceArn") or "*"
         name = _safe_json_field(body, "logGroupName")
         if name:
             return f"arn:aws:logs:{region}:{account_id}:log-group:{name}"
@@ -1246,12 +1249,14 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "signer":
-        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # StartSigningJob, GetSigningProfile, CancelSigningProfile and the
+        # three profile-permission actions are scoped to the profile,
         # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
         # carry no resource (Service Authorization Reference). The ARNs put a
         # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
         parts = [p for p in path.split("/") if p]
-        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+        if (parts and parts[0] == "signing-profiles" and len(parts) > 1
+                and not (method == "PUT" and len(parts) == 2)):
             return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
         if parts and parts[0] == "signing-jobs":
             if len(parts) > 1:
@@ -1694,6 +1699,90 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     ]
 
 
+def logs_service_context(action: str, body: bytes, resource_arn: str,
+                         region: str, account_id: str) -> dict:
+    """Tag conditions from the Logs payload and the existing scoped resource.
+
+    Read stored tags before dispatch: incoming tags must not replace ownership
+    context, and an untag request must still see the tags it proposes removing.
+    """
+    from ministack.services import cloudwatch_logs as logs
+
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    context = {}
+
+    def add_tags(prefix, tags):
+        if not isinstance(tags, dict):
+            return
+        for name, value in tags.items():
+            key = f"{prefix}/{name}".lower()
+            if key not in context:
+                context[key] = value
+            else:
+                previous = context[key]
+                context[key] = (previous if isinstance(previous, list) else [previous]) + [value]
+
+    if action in {"CreateLogGroup", "TagLogGroup", "TagResource"}:
+        tags = data.get("tags", {})
+        if isinstance(tags, dict):
+            add_tags("aws:RequestTag", tags)
+            context["aws:TagKeys"] = list(tags)
+    elif action in {"UntagLogGroup", "UntagResource"}:
+        keys = data.get("tags" if action == "UntagLogGroup" else "tagKeys", [])
+        if isinstance(keys, list):
+            context["aws:TagKeys"] = keys
+
+    if action == "CreateLogGroup":
+        return context
+    record = logs.resolve_tag_resource(resource_arn, account_id=account_id, region=region)
+    if record is not None:
+        add_tags("aws:ResourceTag", record.get("tags", {}))
+    return context
+_DYNAMODB_TRANSACT_ITEM_ACTIONS = {
+    "ConditionCheck": "dynamodb:ConditionCheckItem",
+    "Put": "dynamodb:PutItem",
+    "Update": "dynamodb:UpdateItem",
+    "Delete": "dynamodb:DeleteItem",
+    "Get": "dynamodb:GetItem",
+}
+
+
+def dynamodb_transaction_checks(
+    iam_action: str, body: bytes, region: str, account_id: str
+) -> list[tuple[str, str]]:
+    """Per-item ``(action, table ARN)`` checks of a DynamoDB transaction.
+
+    ``TransactWriteItems`` and ``TransactGetItems`` are not IAM actions: each
+    item is authorized as the single-item action it performs, on its own table.
+    An item naming more than one member (AWS rejects it, the handler does not)
+    is checked for every member, so none can ride along unchecked.
+    Returns an empty list for any other action or a body with no usable item.
+    """
+    if iam_action not in ("dynamodb:TransactWriteItems", "dynamodb:TransactGetItems"):
+        return []
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    items = data.get("TransactItems") if isinstance(data, dict) else None
+    checks = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for member, action in _DYNAMODB_TRANSACT_ITEM_ACTIONS.items():
+            detail = item.get(member)
+            table = detail.get("TableName") if isinstance(detail, dict) else None
+            if isinstance(table, str) and table:
+                checks.append((action, f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"))
+    return checks
+
+
 def dynamodb_service_context(body: bytes) -> dict:
     """The DynamoDB condition keys a request carries.
 
@@ -1752,9 +1841,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if service == "ssm" and not error_code:
-        # SSM authorization denials are HTTP 400, JSON 1.1, with a capitalized
-        # Message naming the resource.
+    if service in {"ssm", "logs"} and not error_code:
+        # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
+        # capitalized Message naming the resource, as observed on live AWS.
         reason = (
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
