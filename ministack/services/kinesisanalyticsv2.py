@@ -27,10 +27,12 @@ renders the Description shape from it. Stores are per account and region.
 """
 
 import base64
+import contextvars
 import copy
 import hashlib
 import json
 import logging
+import threading
 import time
 
 from ministack.core.responses import (
@@ -411,7 +413,7 @@ def delete_application(data, check_timestamp=True):
         return _error("ResourceInUseException",
                       f"Application {name} is in {record['ApplicationStatus']} status and cannot be deleted.")
     if _dataplane is not None and record.get("_driven"):
-        _dataplane_call("delete", _dataplane_view(record))
+        _in_background(_dataplane_call, "delete", _dataplane_view(record))
     del _applications[name]
     _snapshots.pop(name, None)
     _tags.pop(record["ApplicationARN"], None)
@@ -429,6 +431,14 @@ def _dataplane_call(method, *args):
     except Exception:
         logger.exception("kinesisanalyticsv2 data plane %s failed", method)
         return None
+
+
+def _in_background(fn, *args):
+    """Run slow data plane work (savepoints, container removal) off the
+    request path, in the caller's account and region context, so other
+    requests (including the job's own writes to MiniStack) are not blocked."""
+    ctx = contextvars.copy_context()
+    threading.Thread(target=ctx.run, args=(fn, *args), daemon=True).start()
 
 
 def _status_callback(record):
@@ -465,8 +475,15 @@ def _launch(record, savepoint):
 
 
 def _restart_in_place(record):
-    savepoint = _dataplane_call("stop", _dataplane_view(record), False, True)
-    _launch(record, savepoint)
+    """A running application restarts on its new configuration from a savepoint."""
+    record["_driven"] = True
+    view = _dataplane_view(record)
+
+    def restart():
+        savepoint = _dataplane_call("stop", view, False, True)
+        _launch(record, savepoint)
+
+    _in_background(restart)
 
 
 def _start_application(data):
@@ -484,6 +501,9 @@ def _start_application(data):
         if not snap:
             return _error("InvalidArgumentException",
                           f"Snapshot {restore.get('SnapshotName')} does not exist for application {name}.")
+        if snap["SnapshotStatus"] != "READY":
+            return _error("InvalidArgumentException",
+                          f"Snapshot {restore.get('SnapshotName')} is {snap['SnapshotStatus']} and cannot be restored.")
     record["_RunConfiguration"] = run
     record["ApplicationStatus"] = "STARTING"
     if _dataplane is not None and _dataplane.available():
@@ -508,15 +528,24 @@ def _stop_application(data):
     snapshots_on = bool((record["_Configuration"].get("ApplicationSnapshotConfiguration") or {})
                         .get("SnapshotsEnabled"))
     take_snapshot = snapshots_on and not force
-    if record.get("_driven"):
-        savepoint = _dataplane_call("stop", _dataplane_view(record), force, take_snapshot)
-        record["_driven"] = False
-    else:
-        savepoint = None
-    if take_snapshot:
-        # Managed Flink takes a snapshot on a graceful stop when snapshots are enabled.
-        _add_snapshot(record, f"stop-{int(time.time() * 1000)}", savepoint)
     record["ApplicationStatus"] = "FORCE_STOPPING" if force else "STOPPING"
+    # Managed Flink takes a snapshot on a graceful stop when snapshots are enabled.
+    snapshot_name = f"stop-{int(time.time() * 1000)}" if take_snapshot else None
+    if record.get("_driven"):
+        view = _dataplane_view(record)
+        if snapshot_name:
+            _add_snapshot(record, snapshot_name, None, status="CREATING")
+
+        def stop():
+            savepoint = _dataplane_call("stop", view, force, take_snapshot)
+            if snapshot_name:
+                _finish_snapshot(record["ApplicationName"], snapshot_name, savepoint)
+            record["ApplicationStatus"] = "READY"
+            record["_driven"] = False
+
+        _in_background(stop)
+    elif snapshot_name:
+        _add_snapshot(record, snapshot_name, None)
     return json_response({"OperationId": _new_token()})
 
 
@@ -524,10 +553,10 @@ def _stop_application(data):
 # Snapshots
 # ---------------------------------------------------------------------------
 
-def _add_snapshot(record, snapshot_name, savepoint_path):
+def _add_snapshot(record, snapshot_name, savepoint_path, status="READY"):
     snap = {
         "SnapshotName": snapshot_name,
-        "SnapshotStatus": "READY",
+        "SnapshotStatus": status,
         "ApplicationVersionId": record["ApplicationVersionId"],
         "SnapshotCreationTimestamp": time.time(),
         "RuntimeEnvironment": record["RuntimeEnvironment"],
@@ -536,6 +565,20 @@ def _add_snapshot(record, snapshot_name, savepoint_path):
         snap["_SavepointPath"] = savepoint_path
     _snapshots.setdefault(record["ApplicationName"], {})[snapshot_name] = snap
     return snap
+
+
+def _finish_snapshot(app_name, snapshot_name, savepoint_path):
+    """A savepoint the data plane took makes the snapshot READY; none means it
+    failed, so a later restore cannot silently start from an empty state."""
+    snap = (_snapshots.get(app_name) or {}).get(snapshot_name)
+    if snap is None:
+        return
+    if savepoint_path:
+        snap["_SavepointPath"] = savepoint_path
+        snap["SnapshotStatus"] = "READY"
+    else:
+        snap["SnapshotStatus"] = "FAILED"
+        logger.warning("Flink application %s: snapshot %s failed", app_name, snapshot_name)
 
 
 def _snapshot_view(snap):
@@ -557,8 +600,14 @@ def _create_application_snapshot(data):
                       "a snapshot needs a RUNNING application.")
     if snapshot_name in (_snapshots.get(name) or {}):
         return _error("ResourceInUseException", f"Snapshot {snapshot_name} already exists.")
-    savepoint = _dataplane_call("snapshot", _dataplane_view(record), snapshot_name) if record.get("_driven") else None
-    _add_snapshot(record, snapshot_name, savepoint)
+    if record.get("_driven"):
+        view = _dataplane_view(record)
+        _add_snapshot(record, snapshot_name, None, status="CREATING")
+        _in_background(lambda: _finish_snapshot(
+            name, snapshot_name, _dataplane_call("snapshot", view, snapshot_name)))
+    else:
+        # No job runs, so the snapshot is a record without saved state.
+        _add_snapshot(record, snapshot_name, None)
     return json_response({})
 
 
