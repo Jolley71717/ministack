@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Managed Service for Apache Flink — control plane** — `kinesisanalyticsv2` applications for the `FLINK-*` runtimes: create, describe, update and delete, start and stop with the model's status transitions, snapshots, CloudWatch logging options and tags, per account and region. Updates bump `ApplicationVersionId` and the `ConditionalToken`, and a stale one returns `ConcurrentModificationException`. CloudFormation creates, updates and deletes `AWS::KinesisAnalyticsV2::Application`, `AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption` and `AWS::Logs::LogStream`, so a CDK Flink stack deploys. The Flink job itself does not run yet.
+
 ## [1.5.24] — 2026-10-08
 
 ### Added

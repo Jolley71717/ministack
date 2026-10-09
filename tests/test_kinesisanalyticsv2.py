@@ -365,3 +365,80 @@ def test_restored_running_application_comes_back_ready(local_state):
     kda.reset()
     kda.load_persisted_state(state)
     assert kda._applications["persisted"]["ApplicationStatus"] == "READY"
+
+
+# ---------------------------------------------------------------------------
+# CloudFormation (the resources a CDK Flink stack synthesizes)
+# ---------------------------------------------------------------------------
+
+def _wait_stack(cfn, name, timeout=30):
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            stack = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        except ClientError as exc:
+            if "does not exist" in str(exc):
+                return {"StackStatus": "DELETE_COMPLETE"}
+            raise
+        if not stack["StackStatus"].endswith("_IN_PROGRESS"):
+            return stack
+        time.sleep(0.3)
+    raise AssertionError(f"stack {name} did not settle")
+
+
+def _flink_template(app_name, group, value):
+    import json
+
+    return json.dumps({"Resources": {
+        "Logs": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": group}},
+        "Stream": {"Type": "AWS::Logs::LogStream",
+                   "Properties": {"LogGroupName": {"Ref": "Logs"}, "LogStreamName": "flink"}},
+        "App": {"Type": "AWS::KinesisAnalyticsV2::Application", "Properties": {
+            "ApplicationName": app_name,
+            "RuntimeEnvironment": RUNTIME,
+            "ServiceExecutionRole": ROLE,
+            "ApplicationConfiguration": {
+                **CODE,
+                "ApplicationSnapshotConfiguration": {"SnapshotsEnabled": True},
+                "EnvironmentProperties": {"PropertyGroups": [
+                    {"PropertyGroupId": "app", "PropertyMap": {"value": value}}]},
+            },
+        }},
+        "AppLogging": {"Type": "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption",
+                       "DependsOn": "Stream",
+                       "Properties": {"ApplicationName": {"Ref": "App"}, "CloudWatchLoggingOption": {
+                           "LogStreamARN": {"Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:"
+                                                       f"log-group:{group}:log-stream:flink"}}}},
+    }})
+
+
+def test_cloudformation_flink_stack(cfn, logs, kinesisanalyticsv2):
+    stack, app, group = _name("flink-stack"), _name("cfn-app"), f"/flink/{_name()}"
+    cfn.create_stack(StackName=stack, TemplateBody=_flink_template(app, group, "1"))
+    assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+
+    detail = _detail(kinesisanalyticsv2, app)
+    assert detail["ApplicationStatus"] == "READY"
+    groups = detail["ApplicationConfigurationDescription"]["EnvironmentPropertyDescriptions"]
+    assert groups["PropertyGroupDescriptions"][0]["PropertyMap"] == {"value": "1"}
+    [option] = detail["CloudWatchLoggingOptionDescriptions"]
+    assert option["LogStreamARN"].endswith(f"log-group:{group}:log-stream:flink")
+    streams = logs.describe_log_streams(logGroupName=group)["logStreams"]
+    assert [s["logStreamName"] for s in streams] == ["flink"]
+    version = detail["ApplicationVersionId"]
+
+    cfn.update_stack(StackName=stack, TemplateBody=_flink_template(app, group, "2"))
+    assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+    detail = _detail(kinesisanalyticsv2, app)
+    groups = detail["ApplicationConfigurationDescription"]["EnvironmentPropertyDescriptions"]
+    assert groups["PropertyGroupDescriptions"][0]["PropertyMap"] == {"value": "2"}
+    assert detail["ApplicationVersionId"] > version
+    assert len(detail["CloudWatchLoggingOptionDescriptions"]) == 1
+
+    cfn.delete_stack(StackName=stack)
+    assert _wait_stack(cfn, stack)["StackStatus"] == "DELETE_COMPLETE"
+    with pytest.raises(ClientError) as exc:
+        _detail(kinesisanalyticsv2, app)
+    assert _code(exc) == "ResourceNotFoundException"

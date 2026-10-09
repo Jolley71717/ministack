@@ -374,6 +374,28 @@ def update_application(data):
     return json_response({"ApplicationDetail": application_detail(record), "OperationId": operation_id})
 
 
+def replace_from_template(name, props):
+    """CloudFormation update: the template's ApplicationConfiguration replaces
+    the stored one (UpdateApplication takes a diff, a template carries the
+    whole desired state). A running application restarts on it."""
+    record = _get(name)
+    if record is None:
+        raise ValueError(f"Application {name} is not found.")
+    record["_Configuration"] = copy.deepcopy(props.get("ApplicationConfiguration") or {})
+    for key in ("RuntimeEnvironment", "ServiceExecutionRole"):
+        if props.get(key):
+            record[key] = props[key]
+    if props.get("ApplicationDescription") is not None:
+        record["ApplicationDescription"] = props["ApplicationDescription"]
+    if props.get("RunConfiguration") is not None:
+        record["_RunConfiguration"] = copy.deepcopy(props["RunConfiguration"])
+    _bump_version(record)
+    if record["ApplicationStatus"] == "RUNNING":
+        record["ApplicationStatus"] = "UPDATING"
+        if _dataplane is not None and _dataplane.available():
+            _restart_in_place(record)
+
+
 def delete_application(data, check_timestamp=True):
     """DeleteApplication; also used by the CloudFormation provisioner."""
     name = data.get("ApplicationName")
