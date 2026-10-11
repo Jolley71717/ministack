@@ -106,23 +106,29 @@ Evidence the library is needed (docs, not an AWS run):
 - **Defaults:** checkpoint (enabled, 60000, 5000), monitoring (APPLICATION, INFO), parallelism (1, 1, autoscaling true), `RunConfigurationDescription` after restore, and `ApplicationVersionId` values.
 - **The runtime library:** `aws-kinesisanalytics-runtime` is on the AWS classpath, since a jar without it ran. That supports the `/opt/ministack/flink-lib` design with a real AWS observation.
 
-**Differences (AWS behavior → what MiniStack does today). All are in `kinesisanalyticsv2.py` except where noted:**
+**Differences found, all fixed in commit "fix(kinesisanalyticsv2): match behavior observed on AWS"** (they were in `kinesisanalyticsv2.py`, done with Luke's go):
 
-| # | Step | AWS | MiniStack |
+| # | Step | AWS (now also MiniStack) | MiniStack before |
 |---|---|---|---|
-| 1 | CreateApplicationSnapshot while READY | `InvalidRequestException` ("... is in READY status. Snapshot creation is only allowed ...") | `ResourceInUseException` |
-| 2 | UpdateApplication while RUNNING, snapshots enabled | takes a snapshot named `UPDATEAPPLICATION-<app>-<epoch ms>` (READY) | no snapshot record (the data plane does take a savepoint and restarts from it) |
-| 3 | Graceful stop, snapshots enabled | snapshot named `STOP-<app>-<epoch ms>` | `stop-<epoch ms>` |
-| 4 | CreateApplicationSnapshot with `SnapshotsEnabled=false` (app RUNNING) | **accepted** | `InvalidApplicationConfigurationException` |
-| 5 | Second AddApplicationCloudWatchLoggingOption (same stream) | `InvalidArgumentException`: "Kinesis Analytics currently supports only 1 logging option." | `InvalidArgumentException` with a different rule: MiniStack allows several distinct streams |
+| 1 | CreateApplicationSnapshot while READY | `InvalidRequestException` | `ResourceInUseException` |
+| 2 | UpdateApplication while RUNNING, snapshots enabled | snapshot `UPDATEAPPLICATION-<app>-<epoch ms>` with the pre-update version | no snapshot record |
+| 3 | Graceful stop, snapshots enabled | snapshot `STOP-<app>-<epoch ms>` | `stop-<epoch ms>` |
+| 4 | CreateApplicationSnapshot with `SnapshotsEnabled=false` (RUNNING) | accepted | `InvalidApplicationConfigurationException` |
+| 5 | A second logging option | `InvalidArgumentException` "Kinesis Analytics currently supports only 1 logging option." | several distinct streams allowed |
 | 6 | DeleteApplication with the wrong CreateTimestamp | `ConcurrentModificationException` | `InvalidArgumentException` |
-| 7 | Logging option id after adding at version 5 | `5.1` | `1.1` |
-| 8 | AddApplicationCloudWatchLoggingOption response | no `OperationId` | includes `OperationId` |
-| 9 | DescribeApplication for S3 code | `CodeContentDescription` has `CodeMD5` and `CodeSize` of the S3 object | absent (only filled for inline zip) |
-| 10 | DescribeApplication and DescribeApplicationSnapshot | `ApplicationEncryptionConfigurationDescription: {KeyType: AWS_OWNED_KEY}` by default | absent |
-| 11 | DescribeApplication | `ApplicationMaintenanceConfigurationDescription` window `03:00`–`11:00` | absent |
+| 7 | Logging option id | `<version the add created>.1` (`5.1`) | `1.1` |
+| 8 | Add / delete logging option responses | add: no `OperationId`; delete: only ARN and version | both carried options and `OperationId` |
+| 9 | S3 code description | `CodeMD5` and `CodeSize` of the object | absent |
+| 10 | Encryption description (app and snapshot) | `{KeyType: AWS_OWNED_KEY}` by default | absent |
+| 11 | Maintenance window | `03:00`–`11:00` | absent |
+| 12 | ListApplicationSnapshots order | oldest first | newest first |
 
-Error message text differs throughout. Codes and HTTP 400 match except rows 1 and 6.
+Error messages for every observed error now use AWS's wording.
+
+**After the fixes:**
+- The MiniStack run of the same 48 steps matches the AWS run on all 52 compared items: error codes, status sequences (ignoring the short STOPPING, FORCE_STOPPING and UPDATING states that polling can miss on either side), and automatic snapshot names and versions.
+- 0 differences in the compared response fields (describe while READY and RUNNING, logging option add and delete, describe snapshot).
+- Lanes: control plane 415 passed, data plane 8 passed (57.1 s), ruff clean.
 
 **Not covered by this run:**
 - UpdateApplication while RUNNING with snapshots disabled.
@@ -136,7 +142,8 @@ Error message text differs throughout. Codes and HTTP 400 match except rows 1 an
 - **Stop during start:** a force stop while STARTING left the start thread creating containers after the stop's cleanup, and the next start hit a 409 name conflict. A cancelled start now removes what it created, and a new start waits for the previous one. Regression test: force stop while STARTING, then start again.
 - After both fixes: control-plane lane 413 passed, data-plane lane 8 passed (51.1 s), and the MiniStack run of the 48 steps leaves 0 containers.
 
-## Open items for you
+## Open items
 
-- The README services table and the CHANGELOG still say "The Flink job itself does not run yet". That is wrong when Docker is available.
-- Not done: forcing a fresh image pull end to end (images were cached here), a full `Dockerfile.full` build, and any run against real AWS.
+- **Not run**: the CDK and lifecycle-script run against Luke's own deployment. That project lives in a separate private environment and stays out of this repo and these notes. Evidence here comes only from the throwaway account and our own test jobs.
+- **Not run**: a forced fresh image pull end to end, and a full `Dockerfile.full` build. Only the new stage was built.
+- **Kept**: the throwaway account, for re-validation; it costs nothing while idle.
