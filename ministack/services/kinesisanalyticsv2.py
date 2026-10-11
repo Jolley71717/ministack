@@ -123,7 +123,7 @@ def _error(code, message, status=400):
 
 
 def _not_found(name):
-    return _error("ResourceNotFoundException", f"Application {name} is not found.")
+    return _error("ResourceNotFoundException", f"Application '{name}' does not exist.")
 
 
 def _new_token():
@@ -141,12 +141,13 @@ def _check_concurrency(record, data):
     version = data.get("CurrentApplicationVersionId")
     if version is not None and version != record["ApplicationVersionId"]:
         return _error("ConcurrentModificationException",
-                      f"The application version {version} does not match the current version "
-                      f"{record['ApplicationVersionId']}.")
+                      "The provided application version ID does not match the most recent version "
+                      "for the application.")
     token = data.get("ConditionalToken")
     if token is not None and token != record["ConditionalToken"]:
         return _error("ConcurrentModificationException",
-                      "The ConditionalToken does not match the current application.")
+                      "The provided conditional token does not match the current conditional token "
+                      "for the application.")
     return None
 
 
@@ -171,7 +172,7 @@ def _get(name):
 # Rendering: request-shape configuration -> Description shapes
 # ---------------------------------------------------------------------------
 
-def _code_description(code_config):
+def _code_description(code_config, code_stats=None):
     content = code_config.get("CodeContent") or {}
     described = {}
     if "S3ContentLocation" in content:
@@ -179,6 +180,8 @@ def _code_description(code_config):
         described["S3ApplicationCodeLocationDescription"] = {
             k: loc[k] for k in ("BucketARN", "FileKey", "ObjectVersion") if k in loc
         }
+        # AWS reports the size and MD5 of the S3 object too.
+        described.update(code_stats or {})
     if "TextContent" in content:
         described["TextContent"] = content["TextContent"]
     if "ZipFileContent" in content:
@@ -215,7 +218,7 @@ def _configuration_description(record):
     described = {}
     if "ApplicationCodeConfiguration" in config:
         described["ApplicationCodeConfigurationDescription"] = _code_description(
-            config["ApplicationCodeConfiguration"])
+            config["ApplicationCodeConfiguration"], record.get("_CodeStats"))
     described["FlinkApplicationConfigurationDescription"] = _flink_description(
         config.get("FlinkApplicationConfiguration") or {})
     groups = (config.get("EnvironmentProperties") or {}).get("PropertyGroups")
@@ -227,9 +230,7 @@ def _configuration_description(record):
     rollback = config.get("ApplicationSystemRollbackConfiguration") or {}
     described["ApplicationSystemRollbackConfigurationDescription"] = {
         "RollbackEnabled": bool(rollback.get("RollbackEnabled", False))}
-    if "ApplicationEncryptionConfiguration" in config:
-        described["ApplicationEncryptionConfigurationDescription"] = copy.deepcopy(
-            config["ApplicationEncryptionConfiguration"])
+    described["ApplicationEncryptionConfigurationDescription"] = _encryption_description(record)
     if record.get("_RunConfiguration"):
         run = record["_RunConfiguration"]
         described["RunConfigurationDescription"] = {
@@ -241,11 +242,41 @@ def _configuration_description(record):
     return described
 
 
+def _encryption_description(record):
+    """AWS reports an AWS-owned key when none is configured."""
+    configured = (record.get("_Configuration") or {}).get("ApplicationEncryptionConfiguration")
+    return copy.deepcopy(configured) if configured else {"KeyType": "AWS_OWNED_KEY"}
+
+
+# The maintenance window AWS reported for a new application (us-east-1).
+_MAINTENANCE_WINDOW = {"ApplicationMaintenanceWindowStartTime": "03:00",
+                       "ApplicationMaintenanceWindowEndTime": "11:00"}
+
+
+def _refresh_code_stats(record):
+    """Size and MD5 of the application's S3 code, as DescribeApplication reports them."""
+    loc = (((record.get("_Configuration") or {}).get("ApplicationCodeConfiguration") or {})
+           .get("CodeContent") or {}).get("S3ContentLocation")
+    record.pop("_CodeStats", None)
+    if not loc:
+        return
+    try:
+        from ministack.services import s3 as _s3
+
+        data = _s3._get_object_data(loc.get("BucketARN", "").split(":::", 1)[-1], loc.get("FileKey", ""),
+                                    loc.get("ObjectVersion") or None)
+    except Exception:
+        data = None
+    if data is not None:
+        record["_CodeStats"] = {"CodeMD5": hashlib.md5(data).hexdigest(), "CodeSize": len(data)}
+
+
 def application_detail(record):
     """The ApplicationDetail shape for a stored record (also the data plane's view)."""
     detail = {k: copy.deepcopy(v) for k, v in record.items() if not k.startswith("_")}
     detail["ApplicationConfigurationDescription"] = _configuration_description(record)
     detail["CloudWatchLoggingOptionDescriptions"] = copy.deepcopy(record.get("_LoggingOptions", []))
+    detail["ApplicationMaintenanceConfigurationDescription"] = dict(_MAINTENANCE_WINDOW)
     return detail
 
 
@@ -260,9 +291,9 @@ def _dataplane_view(record):
 # Applications
 # ---------------------------------------------------------------------------
 
-def _logging_option(option, index):
+def _logging_option(option, option_id):
     return {
-        "CloudWatchLoggingOptionId": f"{index}.1",
+        "CloudWatchLoggingOptionId": option_id,
         "LogStreamARN": option["LogStreamARN"],
         **({"RoleARN": option["RoleARN"]} if option.get("RoleARN") else {}),
     }
@@ -281,7 +312,7 @@ def create_application(data):
                       f"MiniStack supports Apache Flink applications only; RuntimeEnvironment {runtime} "
                       "(SQL and Studio applications) is not implemented.")
     if name in _applications:
-        return _error("ResourceInUseException", f"Application {name} already exists.")
+        return _error("ResourceInUseException", f"Application '{name}' already exists.")
     now = time.time()
     record = {
         "ApplicationARN": _arn(name),
@@ -295,9 +326,10 @@ def create_application(data):
         "ConditionalToken": _new_token(),
         "ApplicationMode": data.get("ApplicationMode", "STREAMING"),
         "_Configuration": copy.deepcopy(data.get("ApplicationConfiguration") or {}),
-        "_LoggingOptions": [_logging_option(o, i + 1)
+        "_LoggingOptions": [_logging_option(o, f"1.{i + 1}")
                             for i, o in enumerate(data.get("CloudWatchLoggingOptions") or [])],
     }
+    _refresh_code_stats(record)
     if data.get("ApplicationDescription"):
         record["ApplicationDescription"] = data["ApplicationDescription"]
     _applications[name] = record
@@ -347,7 +379,7 @@ def update_application(data):
         return _not_found(name)
     if record["ApplicationStatus"] not in ("READY", "RUNNING"):
         return _error("ResourceInUseException",
-                      f"Application {name} is in {record['ApplicationStatus']} status and cannot be updated.")
+                      f"Application cannot be updated in '{record['ApplicationStatus']}' state")
     conflict = _check_concurrency(record, data)
     if conflict:
         return conflict
@@ -365,13 +397,12 @@ def update_application(data):
     if data.get("RunConfigurationUpdate"):
         run = record.setdefault("_RunConfiguration", {})
         _merge(run, _strip_update_suffix(data["RunConfigurationUpdate"]))
+    previous_version = record["ApplicationVersionId"]
     _bump_version(record)
+    _refresh_code_stats(record)
     operation_id = _new_token()
     if record["ApplicationStatus"] == "RUNNING":
-        # A running application restarts on the new configuration.
-        record["ApplicationStatus"] = "UPDATING"
-        if record.get("_driven") and _runs_jobs(record):
-            _restart_in_place(record)
+        _restart_for_update(record, previous_version)
     logger.info("UpdateApplication %s -> version %d", name, record["ApplicationVersionId"])
     return json_response({"ApplicationDetail": application_detail(record), "OperationId": operation_id})
 
@@ -391,11 +422,11 @@ def replace_from_template(name, props):
         record["ApplicationDescription"] = props["ApplicationDescription"]
     if props.get("RunConfiguration") is not None:
         record["_RunConfiguration"] = copy.deepcopy(props["RunConfiguration"])
+    previous_version = record["ApplicationVersionId"]
     _bump_version(record)
+    _refresh_code_stats(record)
     if record["ApplicationStatus"] == "RUNNING":
-        record["ApplicationStatus"] = "UPDATING"
-        if record.get("_driven") and _runs_jobs(record):
-            _restart_in_place(record)
+        _restart_for_update(record, previous_version)
 
 
 def delete_application(data, check_timestamp=True):
@@ -407,8 +438,9 @@ def delete_application(data, check_timestamp=True):
     if check_timestamp:
         stamp = data.get("CreateTimestamp")
         if stamp is None or abs(float(stamp) - record["CreateTimestamp"]) >= 1:
-            return _error("InvalidArgumentException",
-                          "CreateTimestamp does not match the application's create timestamp.")
+            return _error("ConcurrentModificationException",
+                          f"The application with name: '{name}' has a different create timestamp than the "
+                          "one you provided. Please call DescribeApplication to fetch valid create timestamp.")
     if record["ApplicationStatus"] in _TRANSITIONAL:
         return _error("ResourceInUseException",
                       f"Application {name} is in {record['ApplicationStatus']} status and cannot be deleted.")
@@ -480,13 +512,35 @@ def _launch(record, savepoint):
     _dataplane_call("start", _dataplane_view(record), savepoint, _status_callback(record))
 
 
-def _restart_in_place(record):
+def _snapshots_enabled(record):
+    return bool((record["_Configuration"].get("ApplicationSnapshotConfiguration") or {}).get("SnapshotsEnabled"))
+
+
+def _restart_for_update(record, previous_version):
+    """A running application restarts on its new configuration. With snapshots
+    enabled, Managed Flink first takes an UPDATEAPPLICATION-<app>-<ms> snapshot
+    carrying the version before the update (observed on AWS)."""
+    record["ApplicationStatus"] = "UPDATING"
+    snapshot_name = None
+    if _snapshots_enabled(record):
+        snapshot_name = f"UPDATEAPPLICATION-{record['ApplicationName']}-{int(time.time() * 1000)}"
+    driven = record.get("_driven") and _runs_jobs(record)
+    if snapshot_name:
+        snap = _add_snapshot(record, snapshot_name, None, status="CREATING" if driven else "READY")
+        snap["ApplicationVersionId"] = previous_version
+    if driven:
+        _restart_in_place(record, snapshot_name)
+
+
+def _restart_in_place(record, snapshot_name=None):
     """A running application restarts on its new configuration from a savepoint."""
     record["_driven"] = True
     view = _dataplane_view(record)
 
     def restart():
         savepoint = _dataplane_call("stop", view, False, True)
+        if snapshot_name:
+            _finish_snapshot(record["ApplicationName"], snapshot_name, savepoint)
         _launch(record, savepoint)
 
     _in_background(restart)
@@ -499,14 +553,15 @@ def _start_application(data):
         return _not_found(name)
     if record["ApplicationStatus"] != "READY":
         return _error("ResourceInUseException",
-                      f"Application {name} is in {record['ApplicationStatus']} status and cannot be started.")
+                      f"Application cannot be started in '{record['ApplicationStatus']}' state")
     run = copy.deepcopy(data.get("RunConfiguration") or {})
     restore = run.get("ApplicationRestoreConfiguration") or {}
     if restore.get("ApplicationRestoreType") == "RESTORE_FROM_CUSTOM_SNAPSHOT":
         snap = (_snapshots.get(name) or {}).get(restore.get("SnapshotName", ""))
         if not snap:
             return _error("InvalidArgumentException",
-                          f"Snapshot {restore.get('SnapshotName')} does not exist for application {name}.")
+                          f"The snapshot name {restore.get('SnapshotName')} provided for restore configuration "
+                          "does not exist.")
         if snap["SnapshotStatus"] != "READY":
             return _error("InvalidArgumentException",
                           f"Snapshot {restore.get('SnapshotName')} is {snap['SnapshotStatus']} and cannot be restored.")
@@ -529,14 +584,11 @@ def _stop_application(data):
     force = bool(data.get("Force"))
     status = record["ApplicationStatus"]
     if status != "RUNNING" and not (force and status in ("STARTING", "UPDATING")):
-        return _error("ResourceInUseException",
-                      f"Application {name} is in {status} status and cannot be stopped.")
-    snapshots_on = bool((record["_Configuration"].get("ApplicationSnapshotConfiguration") or {})
-                        .get("SnapshotsEnabled"))
-    take_snapshot = snapshots_on and not force
+        return _error("ResourceInUseException", f"Application cannot be Stopped in '{status}' state")
+    take_snapshot = _snapshots_enabled(record) and not force
     record["ApplicationStatus"] = "FORCE_STOPPING" if force else "STOPPING"
     # Managed Flink takes a snapshot on a graceful stop when snapshots are enabled.
-    snapshot_name = f"stop-{int(time.time() * 1000)}" if take_snapshot else None
+    snapshot_name = f"STOP-{name}-{int(time.time() * 1000)}" if take_snapshot else None
     if record.get("_driven"):
         view = _dataplane_view(record)
         if snapshot_name:
@@ -566,6 +618,7 @@ def _add_snapshot(record, snapshot_name, savepoint_path, status="READY"):
         "ApplicationVersionId": record["ApplicationVersionId"],
         "SnapshotCreationTimestamp": time.time(),
         "RuntimeEnvironment": record["RuntimeEnvironment"],
+        "ApplicationEncryptionConfigurationDescription": _encryption_description(record),
     }
     if savepoint_path:
         snap["_SavepointPath"] = savepoint_path
@@ -597,15 +650,14 @@ def _create_application_snapshot(data):
     record = _get(name)
     if record is None:
         return _not_found(name)
-    if not (record["_Configuration"].get("ApplicationSnapshotConfiguration") or {}).get("SnapshotsEnabled"):
-        return _error("InvalidApplicationConfigurationException",
-                      f"Snapshots are not enabled for application {name}.")
+    # AWS accepts a manual snapshot with SnapshotsEnabled false; it only needs RUNNING.
     if record["ApplicationStatus"] != "RUNNING":
-        return _error("ResourceInUseException",
-                      f"Application {name} is in {record['ApplicationStatus']} status; "
-                      "a snapshot needs a RUNNING application.")
+        return _error("InvalidRequestException",
+                      f"Application {name} is in {record['ApplicationStatus']} status. Snapshot creation "
+                      "is only allowed when application is in RUNNING status")
     if snapshot_name in (_snapshots.get(name) or {}):
-        return _error("ResourceInUseException", f"Snapshot {snapshot_name} already exists.")
+        return _error("ResourceInUseException",
+                      f"Provided Snapshot name {snapshot_name} already exists for application {name}")
     if record.get("_driven"):
         view = _dataplane_view(record)
         _add_snapshot(record, snapshot_name, None, status="CREATING")
@@ -621,8 +673,8 @@ def _list_application_snapshots(data):
     name = data.get("ApplicationName")
     if _get(name) is None:
         return _not_found(name)
-    snaps = sorted((_snapshots.get(name) or {}).values(),
-                   key=lambda s: s["SnapshotCreationTimestamp"], reverse=True)
+    # Oldest first, as AWS lists them.
+    snaps = sorted((_snapshots.get(name) or {}).values(), key=lambda s: s["SnapshotCreationTimestamp"])
     limit = int(data.get("Limit") or 50)
     start = int(data.get("NextToken") or 0)
     page = snaps[start:start + limit]
@@ -638,7 +690,8 @@ def _describe_application_snapshot(data):
         return _not_found(name)
     snap = (_snapshots.get(name) or {}).get(data.get("SnapshotName"))
     if not snap:
-        return _error("ResourceNotFoundException", f"Snapshot {data.get('SnapshotName')} is not found.")
+        return _error("ResourceNotFoundException",
+                      f"Snapshot '{data.get('SnapshotName')}' does not exist for application {name}.")
     return json_response({"SnapshotDetails": _snapshot_view(snap)})
 
 
@@ -649,11 +702,14 @@ def _delete_application_snapshot(data):
     snaps = _snapshots.get(name) or {}
     snap = snaps.get(data.get("SnapshotName"))
     if not snap:
-        return _error("ResourceNotFoundException", f"Snapshot {data.get('SnapshotName')} is not found.")
+        return _error("ResourceNotFoundException",
+                      f"Snapshot '{data.get('SnapshotName')}' does not exist for application {name}.")
     stamp = data.get("SnapshotCreationTimestamp")
     if stamp is None or abs(float(stamp) - snap["SnapshotCreationTimestamp"]) >= 1:
         return _error("InvalidArgumentException",
-                      "SnapshotCreationTimestamp does not match the snapshot's creation timestamp.")
+                      f"Snapshot '{data['SnapshotName']}' has a different SnapshotCreationTimestamp than the one "
+                      f"you provided '{int(float(stamp or 0) * 1000)}'. Please call DescribeApplicationSnapshot "
+                      "to fetch valid SnapshotCreationTimestamp.")
     del snaps[data["SnapshotName"]]
     return json_response({})
 
@@ -674,14 +730,12 @@ def add_logging_option(data):
     option = data.get("CloudWatchLoggingOption") or {}
     if not option.get("LogStreamARN"):
         return _error("InvalidArgumentException", "CloudWatchLoggingOption.LogStreamARN is required.")
-    if any(o["LogStreamARN"] == option["LogStreamARN"] for o in record["_LoggingOptions"]):
-        return _error("InvalidArgumentException",
-                      f"Logging option for {option['LogStreamARN']} already exists.")
-    next_index = 1 + max((int(o["CloudWatchLoggingOptionId"].split(".")[0])
-                          for o in record["_LoggingOptions"]), default=0)
-    record["_LoggingOptions"].append(_logging_option(option, next_index))
+    if record["_LoggingOptions"]:
+        return _error("InvalidArgumentException", "Kinesis Analytics currently supports only 1 logging option.")
     _bump_version(record)
-    return json_response(_logging_response(record))
+    # The id carries the version the add creates ("5.1" for an add that made version 5 on AWS).
+    record["_LoggingOptions"].append(_logging_option(option, f"{record['ApplicationVersionId']}.1"))
+    return json_response(_logging_response(record, with_options=True))
 
 
 def delete_logging_option(data):
@@ -699,16 +753,15 @@ def delete_logging_option(data):
         return _error("ResourceNotFoundException", f"Logging option {option_id} is not found.")
     record["_LoggingOptions"] = remaining
     _bump_version(record)
-    return json_response(_logging_response(record))
+    return json_response(_logging_response(record, with_options=False))
 
 
-def _logging_response(record):
-    return {
-        "ApplicationARN": record["ApplicationARN"],
-        "ApplicationVersionId": record["ApplicationVersionId"],
-        "CloudWatchLoggingOptionDescriptions": copy.deepcopy(record["_LoggingOptions"]),
-        "OperationId": _new_token(),
-    }
+def _logging_response(record, with_options):
+    """AWS answers an add with the options and a delete with the ARN and version only."""
+    out = {"ApplicationARN": record["ApplicationARN"], "ApplicationVersionId": record["ApplicationVersionId"]}
+    if with_options:
+        out["CloudWatchLoggingOptionDescriptions"] = copy.deepcopy(record["_LoggingOptions"])
+    return out
 
 
 # ---------------------------------------------------------------------------

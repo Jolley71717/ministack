@@ -118,7 +118,7 @@ def test_delete_requires_the_create_timestamp(kinesisanalyticsv2):
     created = _detail(kinesisanalyticsv2, name)["CreateTimestamp"]
     with pytest.raises(ClientError) as exc:
         kinesisanalyticsv2.delete_application(ApplicationName=name, CreateTimestamp=0)
-    assert _code(exc) == "InvalidArgumentException"
+    assert _code(exc) == "ConcurrentModificationException"  # observed on AWS
     kinesisanalyticsv2.delete_application(ApplicationName=name, CreateTimestamp=created)
     with pytest.raises(ClientError) as exc:
         _detail(kinesisanalyticsv2, name)
@@ -222,7 +222,7 @@ def test_snapshot_lifecycle(kinesisanalyticsv2):
     name = _create(kinesisanalyticsv2, ApplicationSnapshotConfiguration={"SnapshotsEnabled": True})
     with pytest.raises(ClientError) as exc:
         kinesisanalyticsv2.create_application_snapshot(ApplicationName=name, SnapshotName="s1")
-    assert _code(exc) == "ResourceInUseException"  # not running yet
+    assert _code(exc) == "InvalidRequestException"  # not running yet (observed on AWS)
 
     kinesisanalyticsv2.start_application(ApplicationName=name)
     _detail(kinesisanalyticsv2, name)
@@ -236,12 +236,14 @@ def test_snapshot_lifecycle(kinesisanalyticsv2):
     assert snap["SnapshotStatus"] == "READY"
     assert snap["ApplicationVersionId"] == 1
     assert snap["RuntimeEnvironment"] == RUNTIME
+    assert snap["ApplicationEncryptionConfigurationDescription"] == {"KeyType": "AWS_OWNED_KEY"}
 
     # A graceful stop with snapshots enabled takes another snapshot.
     kinesisanalyticsv2.stop_application(ApplicationName=name)
     summaries = kinesisanalyticsv2.list_application_snapshots(ApplicationName=name)["SnapshotSummaries"]
     assert len(summaries) == 2
-    assert summaries[-1]["SnapshotName"] == "s1"  # newest first
+    assert summaries[0]["SnapshotName"] == "s1"  # oldest first, as AWS lists them
+    assert summaries[1]["SnapshotName"].startswith(f"STOP-{name}-")
 
     with pytest.raises(ClientError) as exc:
         kinesisanalyticsv2.delete_application_snapshot(
@@ -255,13 +257,52 @@ def test_snapshot_lifecycle(kinesisanalyticsv2):
     assert _code(exc) == "ResourceNotFoundException"
 
 
-def test_snapshot_needs_snapshots_enabled(kinesisanalyticsv2):
+def test_manual_snapshot_with_snapshots_disabled(kinesisanalyticsv2):
+    """AWS accepts CreateApplicationSnapshot on a RUNNING app with SnapshotsEnabled false."""
     name = _create(kinesisanalyticsv2)
     kinesisanalyticsv2.start_application(ApplicationName=name)
     _detail(kinesisanalyticsv2, name)
-    with pytest.raises(ClientError) as exc:
-        kinesisanalyticsv2.create_application_snapshot(ApplicationName=name, SnapshotName="s1")
-    assert _code(exc) == "InvalidApplicationConfigurationException"
+    kinesisanalyticsv2.create_application_snapshot(ApplicationName=name, SnapshotName="s1")
+    snap = kinesisanalyticsv2.describe_application_snapshot(ApplicationName=name, SnapshotName="s1")
+    assert snap["SnapshotDetails"]["SnapshotStatus"] == "READY"
+
+
+def test_update_of_running_application_takes_a_snapshot(kinesisanalyticsv2):
+    """With snapshots enabled, AWS records UPDATEAPPLICATION-<app>-<ms> with the pre-update version."""
+    name = _create(kinesisanalyticsv2, ApplicationSnapshotConfiguration={"SnapshotsEnabled": True})
+    kinesisanalyticsv2.start_application(ApplicationName=name)
+    _detail(kinesisanalyticsv2, name)
+    kinesisanalyticsv2.update_application(
+        ApplicationName=name, CurrentApplicationVersionId=1,
+        ApplicationConfigurationUpdate={"EnvironmentPropertyUpdates": {"PropertyGroups": [
+            {"PropertyGroupId": "g", "PropertyMap": {"k": "v"}}]}})
+    [snap] = kinesisanalyticsv2.list_application_snapshots(ApplicationName=name)["SnapshotSummaries"]
+    assert snap["SnapshotName"].startswith(f"UPDATEAPPLICATION-{name}-")
+    assert snap["ApplicationVersionId"] == 1
+
+
+def test_describe_reports_aws_defaults(kinesisanalyticsv2, s3):
+    """Code size and MD5 of the S3 object, the AWS-owned key and the maintenance window."""
+    import hashlib
+
+    bucket = f"kda-code-{uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="app.jar", Body=b"jar-bytes")
+    name = _name()
+    kinesisanalyticsv2.create_application(
+        ApplicationName=name, RuntimeEnvironment=RUNTIME, ServiceExecutionRole=ROLE,
+        ApplicationConfiguration={"ApplicationCodeConfiguration": {
+            "CodeContentType": "ZIPFILE",
+            "CodeContent": {"S3ContentLocation": {"BucketARN": f"arn:aws:s3:::{bucket}", "FileKey": "app.jar"}}}})
+    detail = _detail(kinesisanalyticsv2, name)
+    code = detail["ApplicationConfigurationDescription"]["ApplicationCodeConfigurationDescription"][
+        "CodeContentDescription"]
+    assert code["CodeSize"] == len(b"jar-bytes")
+    assert code["CodeMD5"] == hashlib.md5(b"jar-bytes").hexdigest()
+    assert detail["ApplicationConfigurationDescription"]["ApplicationEncryptionConfigurationDescription"] == {
+        "KeyType": "AWS_OWNED_KEY"}
+    assert detail["ApplicationMaintenanceConfigurationDescription"] == {
+        "ApplicationMaintenanceWindowStartTime": "03:00", "ApplicationMaintenanceWindowEndTime": "11:00"}
 
 
 def test_restore_from_unknown_custom_snapshot(kinesisanalyticsv2):
@@ -298,19 +339,22 @@ def test_cloudwatch_logging_options(kinesisanalyticsv2):
         ApplicationName=name, CurrentApplicationVersionId=1,
         CloudWatchLoggingOption={"LogStreamARN": stream})
     assert added["ApplicationVersionId"] == 2
+    assert "OperationId" not in added
     [option] = added["CloudWatchLoggingOptionDescriptions"]
     assert option["LogStreamARN"] == stream
+    assert option["CloudWatchLoggingOptionId"] == "2.1"  # the version the add created
     assert _detail(kinesisanalyticsv2, name)["CloudWatchLoggingOptionDescriptions"] == [option]
 
-    with pytest.raises(ClientError) as exc:
+    with pytest.raises(ClientError) as exc:  # AWS allows only one logging option
         kinesisanalyticsv2.add_application_cloud_watch_logging_option(
-            ApplicationName=name, CloudWatchLoggingOption={"LogStreamARN": stream})
+            ApplicationName=name, CloudWatchLoggingOption={"LogStreamARN": stream + "-other"})
     assert _code(exc) == "InvalidArgumentException"
 
     removed = kinesisanalyticsv2.delete_application_cloud_watch_logging_option(
         ApplicationName=name, CloudWatchLoggingOptionId=option["CloudWatchLoggingOptionId"])
     assert removed["ApplicationVersionId"] == 3
-    assert removed["CloudWatchLoggingOptionDescriptions"] == []
+    assert "CloudWatchLoggingOptionDescriptions" not in removed
+    assert _detail(kinesisanalyticsv2, name)["CloudWatchLoggingOptionDescriptions"] == []
 
 
 def test_tags(kinesisanalyticsv2):
