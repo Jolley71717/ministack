@@ -49,6 +49,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 
 from ministack.core import container_reaper
 from ministack.core.responses import apply_image_prefix, request_scope
@@ -70,6 +71,14 @@ _SAVEPOINT_DIR = "/flink-savepoints"
 # Path the aws-kinesisanalytics-runtime library reads runtime properties from
 # (com.amazonaws:aws-kinesisanalytics-runtime 1.2.0, config.properties).
 _PROPERTIES_PATH = "/etc/flink/application_properties.json"
+# Jars added to every cluster's /opt/flink/lib, like the libraries Managed Flink
+# provides on its classpath. Managed Flink provides
+# com.amazonaws:aws-kinesisanalytics-runtime ("Provided dependencies",
+# Managed Flink developer guide, best practices), and AWS documents building
+# jobs with it in provided scope, so it must come from here. The full image
+# ships it; elsewhere, mount a directory here. Same pattern as the RDS IAM
+# plugin's artifact root.
+_FLINK_LIB_DIR = "/opt/ministack/flink-lib"
 # UID of the ``flink`` user in the official image; the savepoint volume must be
 # writable by it.
 _FLINK_UID = 9999
@@ -387,17 +396,32 @@ def _flink_properties(jm_name, slots, parallelism, endpoint, access_key, checkpo
     return "\n".join(lines)
 
 
-def _properties_archive(payload):
+def _flink_lib_jars():
+    """(name, bytes) for each jar in _FLINK_LIB_DIR; empty when there are none."""
+    root = Path(_FLINK_LIB_DIR)
+    jars = sorted(root.glob("*.jar")) if root.is_dir() else []
+    if not jars:
+        logger.info(
+            "Flink: no jars in %s; jobs must bundle aws-kinesisanalytics-runtime themselves", _FLINK_LIB_DIR
+        )
+    return [(jar.name, jar.read_bytes()) for jar in jars]
+
+
+def _container_archive(properties, jars):
+    """The runtime properties file, plus the jars for the Flink lib directory."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo("etc/flink")
         info.type = tarfile.DIRTYPE
         info.mode = 0o755
         tar.addfile(info)
-        info = tarfile.TarInfo(_PROPERTIES_PATH.lstrip("/"))
-        info.size = len(payload)
-        info.mode = 0o644
-        tar.addfile(info, io.BytesIO(payload))
+        files = [(_PROPERTIES_PATH.lstrip("/"), properties)]
+        files += [(f"opt/flink/lib/{name}", payload) for name, payload in jars]
+        for path, payload in files:
+            info = tarfile.TarInfo(path)
+            info.size = len(payload)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(payload))
     return buf.getvalue()
 
 
@@ -503,7 +527,7 @@ def _launch(client, app, cluster):
         extra_hosts={"host.docker.internal": "host-gateway"},
         detach=True,
     )
-    properties = _properties_archive(_properties_json(app))
+    properties = _container_archive(_properties_json(app), _flink_lib_jars())
 
     jm = client.containers.create(
         command="jobmanager",
