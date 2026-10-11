@@ -96,6 +96,7 @@ public class CounterJob {
         private transient HttpClient http;
         private transient String endpoint;
         private transient String region;
+        private transient String accessKey;
 
         KinesisSink(String stream, String message) {
             this.stream = stream;
@@ -107,6 +108,7 @@ public class CounterJob {
             http = HttpClient.newHttpClient();
             endpoint = System.getenv("AWS_ENDPOINT_URL");
             region = System.getenv("AWS_REGION");
+            accessKey = System.getenv("AWS_ACCESS_KEY_ID");
         }
 
         @Override
@@ -121,7 +123,7 @@ public class CounterJob {
             HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint))
                 .header("Content-Type", "application/x-amz-json-1.1")
                 .header("X-Amz-Target", "Kinesis_20131202.PutRecord")
-                .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260101/" + region
+                .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + accessKey + "/20260101/" + region
                     + "/kinesis/aws4_request, SignedHeaders=host, Signature=0")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();

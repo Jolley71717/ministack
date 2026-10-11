@@ -370,7 +370,7 @@ def update_application(data):
     if record["ApplicationStatus"] == "RUNNING":
         # A running application restarts on the new configuration.
         record["ApplicationStatus"] = "UPDATING"
-        if _dataplane is not None and _dataplane.available():
+        if record.get("_driven") and _runs_jobs(record):
             _restart_in_place(record)
     logger.info("UpdateApplication %s -> version %d", name, record["ApplicationVersionId"])
     return json_response({"ApplicationDetail": application_detail(record), "OperationId": operation_id})
@@ -394,7 +394,7 @@ def replace_from_template(name, props):
     _bump_version(record)
     if record["ApplicationStatus"] == "RUNNING":
         record["ApplicationStatus"] = "UPDATING"
-        if _dataplane is not None and _dataplane.available():
+        if record.get("_driven") and _runs_jobs(record):
             _restart_in_place(record)
 
 
@@ -469,6 +469,12 @@ def _restore_path(record, restore):
     return max(ready, key=lambda s: s["SnapshotCreationTimestamp"]).get("_SavepointPath") if ready else None
 
 
+def _runs_jobs(record):
+    """Docker is available and the data plane has an image for the runtime."""
+    return (_dataplane is not None and _dataplane.available()
+            and _dataplane.supports(record["RuntimeEnvironment"]))
+
+
 def _launch(record, savepoint):
     record["_driven"] = True
     _dataplane_call("start", _dataplane_view(record), savepoint, _status_callback(record))
@@ -506,12 +512,12 @@ def _start_application(data):
                           f"Snapshot {restore.get('SnapshotName')} is {snap['SnapshotStatus']} and cannot be restored.")
     record["_RunConfiguration"] = run
     record["ApplicationStatus"] = "STARTING"
-    if _dataplane is not None and _dataplane.available():
+    if _runs_jobs(record):
         _launch(record, _restore_path(record, restore))
     else:
         record["_driven"] = False
-        logger.info("StartApplication %s: no Docker, so the Flink job does not run "
-                    "(control plane only)", name)
+        logger.info("StartApplication %s: no Docker or no Flink image for %s, so the Flink job "
+                    "does not run (control plane only)", name, record["RuntimeEnvironment"])
     return json_response({"OperationId": _new_token()})
 
 

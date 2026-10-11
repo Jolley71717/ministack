@@ -13,6 +13,8 @@ restore map to Flink savepoints.
 Interface used by the control plane (all synchronous; none raise):
 
 - ``available()``: Docker is reachable.
+- ``supports(runtime)``: this data plane can run jobs for the runtime
+  (``FLINK-1_19`` and ``FLINK-1_20``); other runtimes stay control plane only.
 - ``start(app, savepoint_path, on_status)``: launch the cluster and submit the
   job in a background thread; ``on_status("RUNNING")`` or
   ``on_status("FAILED", message)`` reports the outcome.
@@ -35,10 +37,12 @@ each runtime (Managed Flink developer guide, "Amazon Managed Service for Apache
 Flink 1.19" and "1.20" pages: Flink 1.19.1 and 1.20.5, Java 11).
 """
 
+import hashlib
 import io
 import json
 import logging
 import os
+import re
 import tarfile
 import threading
 import time
@@ -80,6 +84,9 @@ _ministack_network = None
 
 # (account, region, application name) -> cluster record
 _clusters: dict = {}
+# (account, region, application name) -> thread of the latest start, so a new
+# start waits until an earlier one (possibly stopped mid-launch) has finished.
+_starts: dict = {}
 _lock = threading.Lock()
 
 
@@ -139,6 +146,11 @@ def _gateway_endpoint(docker_client, ms_network):
     return f"http://{host}:{port}"
 
 
+def supports(runtime) -> bool:
+    """Whether this data plane can run jobs for ``runtime``."""
+    return runtime in _RUNTIME_IMAGES
+
+
 def available() -> bool:
     client = _get_docker()
     if client is None:
@@ -158,8 +170,25 @@ def _key(app):
 
 
 def _base_name(app):
+    """Docker name prefix for the application's containers, network and volume.
+
+    The JobManager's name is its address on the Docker network, so it must be
+    a valid DNS label: at most 63 characters, letters, digits and hyphens.
+    Application names allow up to 128 characters including '.' and '_', so the
+    readable part is cleaned and shortened, and a hash of the account, region
+    and full name keeps it unique. Labels carry the full identity.
+    """
     account_id, region, name = _key(app)
-    return f"ministack-flink-{account_id}-{region}-{name}"
+    readable = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:20].strip("-") or "app"
+    digest = hashlib.sha256(f"{account_id}/{region}/{name}".encode()).hexdigest()[:10]
+    return f"ministack-flink-{readable}-{digest}"
+
+
+def _access_key(app):
+    """Access key the job signs with. MiniStack treats a 12-digit key as the
+    account id, so the job's calls land in the application's own account."""
+    account_id = app.get("AccountId", "")
+    return account_id if len(account_id) == 12 and account_id.isdigit() else "test"
 
 
 def _image_for(app):
@@ -192,6 +221,22 @@ def _parallelism(app):
         return max(1, int(value))
     except (TypeError, ValueError):
         return 1
+
+
+def _checkpointing(app):
+    """(interval ms, min pause ms) when checkpointing is enabled, else None.
+
+    Managed Flink applies the application's CheckpointConfiguration to the
+    cluster; the control plane fills in the DEFAULT values (enabled, 60000,
+    5000) from the developer guide.
+    """
+    cfg = (
+        (_app_config(app).get("FlinkApplicationConfigurationDescription") or {})
+        .get("CheckpointConfigurationDescription")
+    ) or {}
+    if not cfg.get("CheckpointingEnabled", True):
+        return None
+    return int(cfg.get("CheckpointInterval") or 60000), int(cfg.get("MinPauseBetweenCheckpoints") or 5000)
 
 
 def _allow_non_restored_state(app):
@@ -238,9 +283,20 @@ def _rest(cluster, method, path, body=None, content_type="application/json", tim
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:500]
-        raise RuntimeError(f"Flink REST {method} {path} returned {e.code}: {detail}") from e
+        raise RuntimeError(f"Flink REST {method} {path} returned {e.code}: {_root_cause(e.read())}") from e
     return json.loads(raw) if raw else {}
+
+
+def _root_cause(body):
+    """The innermost ``Caused by`` line of a Flink REST error, which names the
+    real failure (a missing class, an exception from the job's main)."""
+    text = body.decode(errors="replace")
+    try:
+        text = "\n".join(json.loads(text).get("errors") or []) or text
+    except ValueError:
+        pass
+    causes = [line.strip() for line in text.splitlines() if line.strip().startswith("Caused by:")]
+    return (causes[-1] if causes else text.strip().splitlines()[0] if text.strip() else "")[:500]
 
 
 def _upload_jar(cluster, jar_bytes):
@@ -308,22 +364,27 @@ def _wait_for_savepoint(cluster, job_id, trigger_id):
 # ── Containers ────────────────────────────────────────────────────────────────
 
 
-def _flink_properties(jm_name, slots, parallelism, endpoint):
-    return "\n".join(
-        [
-            f"jobmanager.rpc.address: {jm_name}",
-            f"taskmanager.numberOfTaskSlots: {slots}",
-            f"parallelism.default: {parallelism}",
-            f"state.savepoints.dir: file://{_SAVEPOINT_DIR}",
-            f"state.checkpoints.dir: file://{_SAVEPOINT_DIR}/checkpoints",
-            # Flink's S3 filesystem shades AWS SDK v1 and ignores
-            # AWS_ENDPOINT_URL, so point it at MiniStack explicitly.
-            f"s3.endpoint: {endpoint}",
-            "s3.path.style.access: true",
-            "s3.access-key: test",
-            "s3.secret-key: test",
+def _flink_properties(jm_name, slots, parallelism, endpoint, access_key, checkpointing):
+    lines = [
+        f"jobmanager.rpc.address: {jm_name}",
+        f"taskmanager.numberOfTaskSlots: {slots}",
+        f"parallelism.default: {parallelism}",
+        f"state.savepoints.dir: file://{_SAVEPOINT_DIR}",
+        f"state.checkpoints.dir: file://{_SAVEPOINT_DIR}/checkpoints",
+        # Flink's S3 filesystem shades AWS SDK v1 and ignores
+        # AWS_ENDPOINT_URL, so point it at MiniStack explicitly.
+        f"s3.endpoint: {endpoint}",
+        "s3.path.style.access: true",
+        f"s3.access-key: {access_key}",
+        "s3.secret-key: test",
+    ]
+    if checkpointing:
+        interval, min_pause = checkpointing
+        lines += [
+            f"execution.checkpointing.interval: {interval}ms",
+            f"execution.checkpointing.min-pause: {min_pause}ms",
         ]
-    )
+    return "\n".join(lines)
 
 
 def _properties_archive(payload):
@@ -345,6 +406,21 @@ def _remove_container(client, name_or_id):
         client.containers.get(name_or_id).remove(force=True, v=True)
     except Exception:
         pass
+
+
+def _ensure_image(client, image):
+    """Pull the runtime image when it is not local. ``containers.create`` does
+    not pull the way ``containers.run`` does."""
+    try:
+        client.images.get(image)
+        return
+    except Exception:
+        pass
+    logger.info("Flink: pulling %s", image)
+    try:
+        client.images.pull(image)
+    except Exception as e:
+        raise RuntimeError(f"Could not pull Flink image {image}: {e}") from e
 
 
 def _ensure_volume(client, app, image):
@@ -397,6 +473,7 @@ def _launch(client, app, cluster):
     for stale in (jm_name, tm_name):
         _remove_container(client, stale)
 
+    _ensure_image(client, image)
     ms_network = _get_ministack_network(client)
     network, own_network = _ensure_network(client, app, ms_network)
     cluster["network"] = network if own_network else None
@@ -405,11 +482,13 @@ def _launch(client, app, cluster):
 
     parallelism = _parallelism(app)
     env = {
-        "FLINK_PROPERTIES": _flink_properties(jm_name, parallelism, parallelism, endpoint),
+        "FLINK_PROPERTIES": _flink_properties(
+            jm_name, parallelism, parallelism, endpoint, _access_key(app), _checkpointing(app)
+        ),
         "ENABLE_BUILT_IN_PLUGINS": f"flink-s3-fs-hadoop-{image.rsplit(':', 1)[-1].split('-')[0]}.jar",
         # Fixed credentials so the job always authenticates against MiniStack,
-        # whatever the host environment carries.
-        "AWS_ACCESS_KEY_ID": "test",
+        # whatever the host environment carries, in the application's account.
+        "AWS_ACCESS_KEY_ID": _access_key(app),
         "AWS_SECRET_ACCESS_KEY": "test",
         "AWS_REGION": app.get("Region", ""),
         "AWS_DEFAULT_REGION": app.get("Region", ""),
@@ -482,8 +561,15 @@ def _teardown(client, cluster, remove_volume=False, app=None):
             pass
 
 
-def _run(app, cluster, savepoint_path, on_status):
+def _run(app, cluster, savepoint_path, on_status, prior=None, previous=None):
     client = _get_docker()
+    # An earlier start of this application may still be launching containers
+    # under the same names; let it finish (it removes them once it sees it was
+    # cancelled), then make sure nothing of the replaced cluster is left.
+    if prior is not None:
+        prior.join(timeout=_CLUSTER_TIMEOUT + _JOB_TIMEOUT)
+    if previous is not None:
+        _teardown(client, previous)
     try:
         jar, error = _fetch_jar(app)
         if error:
@@ -499,6 +585,9 @@ def _run(app, cluster, savepoint_path, on_status):
         _wait_for_job_running(cluster, job_id, time.monotonic() + _JOB_TIMEOUT)
     except Exception as e:
         if cluster.get("cancelled"):
+            # Stopped or replaced mid-launch: containers created after the
+            # stop's own cleanup would otherwise be left behind.
+            _teardown(client, cluster)
             return
         with _lock:
             if _clusters.get(_key(app)) is cluster:
@@ -536,11 +625,13 @@ def start(app, savepoint_path, on_status):
     with _lock:
         previous = _clusters.get(_key(app))
         _clusters[_key(app)] = cluster
-    client = _get_docker()
-    if previous is not None and client is not None:
-        previous["cancelled"] = True
-        _teardown(client, previous)
-    threading.Thread(target=_run, args=(app, cluster, savepoint_path, on_status), daemon=True).start()
+        if previous is not None:
+            previous["cancelled"] = True
+        thread = threading.Thread(
+            target=_run, args=(app, cluster, savepoint_path, on_status, _starts.get(_key(app)), previous), daemon=True
+        )
+        _starts[_key(app)] = thread
+    thread.start()
 
 
 def snapshot(app, snapshot_name):
@@ -601,6 +692,7 @@ def reset():
     with _lock:
         clusters = list(_clusters.values())
         _clusters.clear()
+        _starts.clear()
     for cluster in clusters:
         cluster["cancelled"] = True
     client = _get_docker()

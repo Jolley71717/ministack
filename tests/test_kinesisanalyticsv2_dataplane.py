@@ -17,10 +17,14 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
+import boto3
 import pytest
+from botocore.config import Config
+from conftest import ENDPOINT, REGION
 
 from ministack.services import kinesisanalyticsv2_flink as dataplane
 
@@ -133,13 +137,13 @@ def counter_jar():
         shutil.rmtree(work, ignore_errors=True)
 
 
-@pytest.fixture
-def flink_app(kinesisanalyticsv2, s3, kin, counter_jar):
-    """An application running the counter job against a fresh Kinesis stream."""
+def _create_app(kinesisanalyticsv2, s3, kin, jar, checkpoint=None, name=None):
+    """An application for the counter job, writing to a fresh Kinesis stream."""
     suffix = uuid.uuid4().hex[:8]
-    bucket, stream, name = f"flink-jars-{suffix}", f"flink-out-{suffix}", f"flink-dp-{suffix}"
+    bucket, stream = f"flink-jars-{suffix}", f"flink-out-{suffix}"
+    name = name or f"flink-dp-{suffix}"
     s3.create_bucket(Bucket=bucket)
-    s3.put_object(Bucket=bucket, Key="counter-job.jar", Body=counter_jar)
+    s3.put_object(Bucket=bucket, Key="counter-job.jar", Body=jar)
     kin.create_stream(StreamName=stream, ShardCount=1)
     kinesisanalyticsv2.create_application(
         ApplicationName=name,
@@ -159,12 +163,16 @@ def flink_app(kinesisanalyticsv2, s3, kin, counter_jar):
             },
             "FlinkApplicationConfiguration": {
                 "ParallelismConfiguration": {"ConfigurationType": "CUSTOM", "Parallelism": 2,
-                                             "ParallelismPerKPU": 1, "AutoScalingEnabled": False}
+                                             "ParallelismPerKPU": 1, "AutoScalingEnabled": False},
+                **({"CheckpointConfiguration": checkpoint} if checkpoint else {}),
             },
             "ApplicationSnapshotConfiguration": {"SnapshotsEnabled": True},
         },
     )
-    yield {"name": name, "stream": stream, "message": f"hello-{suffix}"}
+    return {"name": name, "stream": stream, "message": f"hello-{suffix}"}
+
+
+def _cleanup(kinesisanalyticsv2, name):
     try:
         status = kinesisanalyticsv2.describe_application(ApplicationName=name)["ApplicationDetail"]["ApplicationStatus"]
         if status in ("RUNNING", "STARTING"):
@@ -174,6 +182,35 @@ def flink_app(kinesisanalyticsv2, s3, kin, counter_jar):
         kinesisanalyticsv2.delete_application(ApplicationName=name, CreateTimestamp=created)
     except Exception:
         pass
+
+
+@pytest.fixture
+def flink_app(kinesisanalyticsv2, s3, kin, counter_jar):
+    app = _create_app(kinesisanalyticsv2, s3, kin, counter_jar)
+    yield app
+    _cleanup(kinesisanalyticsv2, app["name"])
+
+
+def _start_and_wait(kinesisanalyticsv2, name):
+    kinesisanalyticsv2.start_application(
+        ApplicationName=name,
+        RunConfiguration={"ApplicationRestoreConfiguration": {"ApplicationRestoreType": "SKIP_RESTORE_FROM_SNAPSHOT"}},
+    )
+    _wait_status(kinesisanalyticsv2, name, "RUNNING")
+
+
+def _jobmanager_rest(name):
+    """The Flink REST API of the application's JobManager, from the host."""
+    [jm] = [c for c in _containers(name) if c.labels.get("role") == "jobmanager"]
+    jm.reload()
+    port = jm.attrs["NetworkSettings"]["Ports"]["8081/tcp"][0]["HostPort"]
+    base = f"http://127.0.0.1:{port}"
+
+    def get(path):
+        with urllib.request.urlopen(base + path, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    return get
 
 
 @requires_docker
@@ -238,3 +275,92 @@ def test_start_with_missing_code_returns_to_ready(kinesisanalyticsv2, s3, flink_
     kinesisanalyticsv2.start_application(ApplicationName=name)
     _wait_status(kinesisanalyticsv2, name, "READY", timeout=60)
     assert _containers(name) == []
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_job_writes_into_the_applications_own_account(counter_jar):
+    """A job runs with the application's account, so its writes land there."""
+    kwargs = dict(endpoint_url=ENDPOINT, aws_access_key_id="111111111111", aws_secret_access_key="test",
+                  region_name=REGION, config=Config(retries={"mode": "standard"}))
+    other_kda, other_s3, other_kin = (boto3.client(svc, **kwargs) for svc in ("kinesisanalyticsv2", "s3", "kinesis"))
+    app = _create_app(other_kda, other_s3, other_kin, counter_jar)
+    try:
+        assert other_kda.describe_application(ApplicationName=app["name"])["ApplicationDetail"][
+            "ApplicationARN"].split(":")[4] == "111111111111"
+        stream = _Stream(other_kin, app["stream"])
+        _start_and_wait(other_kda, app["name"])
+        assert stream.wait_for(2)[0]["message"] == app["message"]
+    finally:
+        _cleanup(other_kda, app["name"])
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_checkpoint_configuration_reaches_the_cluster(kinesisanalyticsv2, s3, kin, counter_jar):
+    app = _create_app(kinesisanalyticsv2, s3, kin, counter_jar, checkpoint={
+        "ConfigurationType": "CUSTOM", "CheckpointingEnabled": True,
+        "CheckpointInterval": 2000, "MinPauseBetweenCheckpoints": 500})
+    try:
+        _start_and_wait(kinesisanalyticsv2, app["name"])
+        rest = _jobmanager_rest(app["name"])
+        [job] = rest("/jobs")["jobs"]
+        assert rest(f"/jobs/{job['id']}/checkpoints/config")["interval"] == 2000
+        deadline = time.monotonic() + 30
+        while rest(f"/jobs/{job['id']}/checkpoints")["counts"]["completed"] < 1:
+            assert time.monotonic() < deadline, "no checkpoint completed within 30s"
+            time.sleep(1)
+    finally:
+        _cleanup(kinesisanalyticsv2, app["name"])
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_runtime_without_an_image_runs_no_containers(kinesisanalyticsv2, s3, kin, counter_jar):
+    app = _create_app(kinesisanalyticsv2, s3, kin, counter_jar)
+    name = app["name"]
+    try:
+        created = kinesisanalyticsv2.describe_application(ApplicationName=name)["ApplicationDetail"]
+        kinesisanalyticsv2.update_application(
+            ApplicationName=name, CurrentApplicationVersionId=created["ApplicationVersionId"],
+            RuntimeEnvironmentUpdate="FLINK-1_18")
+        kinesisanalyticsv2.start_application(ApplicationName=name)
+        _wait_status(kinesisanalyticsv2, name, "RUNNING", timeout=10)
+        assert _containers(name) == []
+        kinesisanalyticsv2.stop_application(ApplicationName=name)
+        _wait_status(kinesisanalyticsv2, name, "READY", timeout=10)
+        [snap] = kinesisanalyticsv2.list_application_snapshots(ApplicationName=name)["SnapshotSummaries"]
+        assert snap["SnapshotStatus"] == "READY"
+    finally:
+        _cleanup(kinesisanalyticsv2, name)
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_long_application_name_with_dots_and_underscores_runs(kinesisanalyticsv2, s3, kin, counter_jar):
+    """Application names allow 128 characters including '.' and '_'; the
+    JobManager's Docker name must still be a valid DNS label."""
+    name = f"Long.App_Name-{uuid.uuid4().hex[:8]}-" + "x" * 105
+    assert len(name) == 128
+    app = _create_app(kinesisanalyticsv2, s3, kin, counter_jar, name=name)
+    try:
+        stream = _Stream(kin, app["stream"])
+        _start_and_wait(kinesisanalyticsv2, name)
+        assert stream.wait_for(1)[0]["message"] == app["message"]
+    finally:
+        _cleanup(kinesisanalyticsv2, name)
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_force_stop_while_starting_then_start_again(kinesisanalyticsv2, kin, flink_app):
+    """A start cancelled mid-launch must not leave containers that block the next start."""
+    name = flink_app["name"]
+    stream = _Stream(kin, flink_app["stream"])
+    kinesisanalyticsv2.start_application(ApplicationName=name)
+    kinesisanalyticsv2.stop_application(ApplicationName=name, Force=True)
+    _wait_status(kinesisanalyticsv2, name, "READY", timeout=60)
+
+    _start_and_wait(kinesisanalyticsv2, name)
+    assert stream.wait_for(1)
+    assert {c.labels.get("role") for c in _containers(name)} == {"jobmanager", "taskmanager"}

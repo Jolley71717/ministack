@@ -462,6 +462,9 @@ class _FakeDataPlane:
     def available(self):
         return True
 
+    def supports(self, runtime):
+        return runtime in ("FLINK-1_19", "FLINK-1_20")
+
     def start(self, app, savepoint_path, on_status):
         self.started.append(savepoint_path)
         on_status("RUNNING")
@@ -569,3 +572,21 @@ def test_data_plane_start_failure_returns_to_ready(local_state, monkeypatch):
     kda.create_application({"ApplicationName": "dp", "RuntimeEnvironment": RUNTIME, "ServiceExecutionRole": ROLE})
     _call("StartApplication", {"ApplicationName": "dp"})
     assert _status() == "READY"
+
+
+def test_runtime_without_an_image_stays_control_plane_only(local_state, monkeypatch):
+    fake = _FakeDataPlane()
+    monkeypatch.setattr(kda, "_dataplane", fake)
+    kda.create_application({"ApplicationName": "dp", "RuntimeEnvironment": "FLINK-1_18", "ServiceExecutionRole": ROLE,
+                            "ApplicationConfiguration": {"ApplicationSnapshotConfiguration": {"SnapshotsEnabled": True}}})
+    _call("StartApplication", {"ApplicationName": "dp"})
+    assert fake.started == []
+
+    def described():
+        return _call("DescribeApplication", {"ApplicationName": "dp"})[1]["ApplicationDetail"]["ApplicationStatus"]
+
+    assert described() == "RUNNING"  # settles on read, as without Docker
+    _call("StopApplication", {"ApplicationName": "dp"})
+    assert described() == "READY"
+    [snap] = kda._snapshots["dp"].values()
+    assert snap["SnapshotStatus"] == "READY"
