@@ -686,6 +686,9 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "Identifier",
         "requires_replacement": _requires_replacement_cognito_resource_server,
     },
+    # Domain is required, so a pool move under the same Domain fails on the
+    # name, as the replacement's CreateUserPoolDomain does.
+    "AWS::Cognito::UserPoolDomain": {"name": "Domain", "exists": "Domain already exists"},
     "AWS::Pipes::Pipe": {
         "name": "Name",
         "requires_replacement": _requires_replacement_pipes,
@@ -1138,6 +1141,12 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::Events::EventBus": ("Tags", "list"),
     "AWS::IAM::Role": ("Tags", "list"),
     "AWS::IAM::User": ("Tags", "list"),
+    "AWS::IoT::CACertificate": ("Tags", "list"),
+    "AWS::IoT::Policy": ("Tags", "list"),
+    "AWS::IoT::ProvisioningTemplate": ("Tags", "list"),
+    "AWS::IoT::ThingGroup": ("Tags", "list"),
+    "AWS::IoT::ThingType": ("Tags", "list"),
+    "AWS::IoT::TopicRule": ("Tags", "list"),
     "AWS::KMS::Key": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
     "AWS::KinesisAnalyticsV2::Application": ("Tags", "list"),
@@ -1153,6 +1162,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::DocDB::DBInstance": ("Tags", "list"),
     "AWS::DocDB::DBSubnetGroup": ("Tags", "list"),
     "AWS::DocDB::DBClusterParameterGroup": ("Tags", "list"),
+    "AWS::SES::ConfigurationSet": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
     "AWS::SSM::Parameter": ("Tags", "map"),
@@ -1180,9 +1190,11 @@ def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
         return props
     prop, shape = spec
     extra = _tag_map(stack_tags)
-    extra["aws:cloudformation:stack-name"] = stack_name
-    extra["aws:cloudformation:stack-id"] = stack_id
-    extra["aws:cloudformation:logical-id"] = logical_id
+    # IoT refuses aws: tag keys and lists none of these on its resources.
+    if not resource_type.startswith("AWS::IoT::"):
+        extra["aws:cloudformation:stack-name"] = stack_name
+        extra["aws:cloudformation:stack-id"] = stack_id
+        extra["aws:cloudformation:logical-id"] = logical_id
     own = props.get(prop)
     if shape == "map":
         merged = {**extra, **(own if isinstance(own, dict) else _tag_map(own))}
@@ -1406,31 +1418,22 @@ def _s3_mrap_create(logical_id, props, stack_name):
         if isinstance(r, dict) and r.get("Bucket")
     ]
 
-    for existing in _s3._mraps.values():
-        if existing.get("Name") == name:
-            return existing["Alias"], {"Alias": existing["Alias"],
-                                       "CreatedAt": existing["CreatedAt"]}
+    existing = _s3.find_mrap(name)
+    if existing is not None and existing.get("Name") == name:
+        return existing["Alias"], {"Alias": existing["Alias"],
+                                   "CreatedAt": existing["CreatedAt"]}
 
-    alias = _s3.new_mrap_alias()
-    created_at = now_iso()
-    _s3._mraps[alias] = {
-        "Name": name,
-        "Alias": alias,
-        "Regions": buckets,
-        "CreatedAt": created_at,
-        "PublicAccessBlockConfiguration": props.get("PublicAccessBlockConfiguration") or {},
-    }
+    # strict=False: the provisioner has never applied the S3 Control bucket checks.
+    record = _s3.create_mrap(name, buckets, props.get("PublicAccessBlockConfiguration") or {}, strict=False)
     logger.info("Created MultiRegionAccessPoint %s alias=%s over %d bucket(s)",
-                name, alias, len(buckets))
+                name, record["Alias"], len(buckets))
     # The physical id is the NAME (what DeleteMultiRegionAccessPoint takes);
     # `Alias` is the attribute a distribution origin is built from.
-    return name, {"Alias": alias, "CreatedAt": created_at}
+    return name, {"Alias": record["Alias"], "CreatedAt": record["CreatedAt"]}
 
 
 def _s3_mrap_delete(physical_id, props):
-    for alias, record in list(_s3._mraps.items()):
-        if record.get("Name") == physical_id:
-            _s3._mraps.pop(alias, None)
+    _s3.delete_mrap(physical_id)
 
 
 def _s3_attrs(name):
@@ -1442,8 +1445,22 @@ def _s3_attrs(name):
     }
 
 
+def s3_bucket_name_conflict(name: str) -> str | None:
+    """The NAME_CONFLICT_VALIDATION message for a bucket name that already exists, or None."""
+    if _s3._bucket_owner_account(name) is None:
+        return None
+    return f"Resource of type 'AWS::S3::Bucket' with identifier '{name}' already exists."
+
+
 def _s3_create(logical_id, props, stack_name):
+    if not props.get("BucketName") and not _NAME_SEED.get():
+        # AWS draws a new auto-name for each stack instance; the seed travels
+        # on the resource record, so updates keep the name.
+        _NAME_SEED.set(new_uuid()[:8])
     name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+    if _s3._bucket_owner_account(name) is not None:
+        # Reached with DisableValidation: the resource handler refuses the existing name.
+        raise ValueError(f"{name} already exists")
     _s3._buckets.setdefault(name, {
         "created": now_iso(),
         "objects": {},
@@ -2149,6 +2166,9 @@ def _lambda_create(logical_id, props, stack_name):
     #    fetch fails.
     code_zip = _zip_inline(code.get("ZipFile"), handler, runtime)
     if code_zip is None and code.get("S3Bucket") and code.get("S3Key"):
+        region_error = _lambda_svc.s3_code_region_message(code["S3Bucket"])
+        if region_error:
+            raise ValueError(region_error)
         code_zip = _lambda_svc._fetch_code_from_s3(
             code["S3Bucket"],
             code["S3Key"],
@@ -2387,7 +2407,14 @@ def _lambda_url_delete(physical_id, props):
 
 # --- IAM Role ---
 
+def _validate_iam_identity_tag_keys(resource_type, tags):
+    """IAM's refusal of user/role tag keys that repeat without case, before any state changes."""
+    if _iam._identity_tags_have_duplicate_keys([{"Key": t.get("Key", "")} for t in tags]):
+        raise ValueError(_iam.DUPLICATE_IDENTITY_TAG_KEYS)
+
+
 def _iam_role_create(logical_id, props, stack_name):
+    _validate_iam_identity_tag_keys("AWS::IAM::Role", props.get("Tags") or [])
     name = props.get("RoleName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:iam::{get_account_id()}:role{props.get('Path', '/')}{name}"
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
@@ -2441,6 +2468,7 @@ def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=N
     RoleName and Path are replaced in ``_update_resource``; the rest updates
     in place, so policies attached from outside the template survive.
     """
+    _validate_iam_identity_tag_keys("AWS::IAM::Role", new_props.get("Tags") or [])
     name = new_props.get("RoleName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )
@@ -2571,6 +2599,7 @@ def _iam_user_create(logical_id, props, stack_name):
 
 
 def _iam_user_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    _validate_iam_identity_tag_keys("AWS::IAM::User", new_props.get("Tags") or [])
     user = _iam._users.get(physical_id)
     if user is None:
         return _iam_user_create(logical_id or physical_id, new_props, stack_name)
@@ -2579,11 +2608,15 @@ def _iam_user_update(physical_id, old_props, new_props, stack_name, logical_id=N
         user["Path"] = path
         user["Arn"] = f"arn:aws:iam::{get_account_id()}:user{path}{physical_id}"
     _iam_user_reconcile(physical_id, old_props, new_props, "update")
-    old_tags, new_tags = _tag_map(old_props.get("Tags")), _tag_map(new_props.get("Tags"))
-    removed = sorted(old_tags.keys() - new_tags.keys())
+    old_tags, new_tags = [
+        {_iam._identity_tag_key(k): (k, v) for k, v in _tag_map(props.get("Tags")).items()}
+        for props in (old_props, new_props)
+    ]
+    removed = [old_tags[k][0] for k in sorted(old_tags.keys() - new_tags.keys())]
     if removed:
         _iam_user_call(_iam._untag_user, {"UserName": physical_id, **_ec_query({"TagKeys": removed})}, "update")
-    changed = [{"Key": k, "Value": v} for k, v in new_tags.items() if old_tags.get(k) != v]
+    changed = [{"Key": key, "Value": value} for k, (key, value) in new_tags.items()
+               if old_tags.get(k) != (key, value)]
     if changed:
         _iam_user_call(_iam._tag_user, {"UserName": physical_id, **_ec_query({"Tags": changed})}, "update")
     return physical_id, {"Arn": user["Arn"]}
@@ -3347,7 +3380,32 @@ def _cwlogs_create(logical_id, props, stack_name):
         "streams": {},
         "subscriptionFilters": {},
     }
+    _cwlogs_sync_resource_policy(name, arn, props)
     return name, {"Arn": arn}
+
+
+def _cwlogs_policy_document(props):
+    document = props.get("ResourcePolicyDocument")
+    if document is None or isinstance(document, str):
+        return document
+    return json.dumps(document, separators=(",", ":"))
+
+
+def _cwlogs_sync_resource_policy(name, arn, props, old_props=None):
+    """Put or delete the group's own resource policy when ResourcePolicyDocument changes."""
+    document = _cwlogs_policy_document(props)
+    if document == (_cwlogs_policy_document(old_props) if old_props else None):
+        return
+    current = _cw_logs._log_group_policies.get(name)
+    request = {"resourceArn": arn.removesuffix(":*")}
+    if current:
+        request["expectedRevisionId"] = current["revisionId"]
+    if document is None:
+        _cw_logs._delete_resource_policy(request)
+        return
+    resp = _cw_logs._put_resource_policy({**request, "policyDocument": document})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::LogGroup ResourcePolicyDocument failed: {resp[2]!r}")
 
 
 def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -3370,6 +3428,7 @@ def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     # it was created with and only the key moves.
     group["kmsKeyId"] = new_props.get("KmsKeyId") or None
     _reconcile_tag_map(group.setdefault("tags", {}), old_props, new_props)
+    _cwlogs_sync_resource_policy(name, group["arn"], new_props, old_props)
     return name, {"Arn": group["arn"]}
 
 
@@ -3379,7 +3438,8 @@ def _cwlogs_import(identifier):
 
 
 def _cwlogs_delete(physical_id, props):
-    _cw_logs._log_groups.pop(physical_id, None)
+    """Delete through DeleteLogGroup, which also drops the group's metric filters, policy and records."""
+    _cw_logs._delete_log_group({"logGroupName": physical_id})
 
 
 # --- Managed Service for Apache Flink (kinesisanalyticsv2) ---
@@ -3667,9 +3727,19 @@ def _cwlogs_metric_filter_delete(physical_id, props):
 
 # --- EventBridge Rule ---
 
+
+def _eb_rule_bus_name(props):
+    # CloudFormation accepts a name or ARN, while the service stores names.
+    bus, error = _eb._event_bus_name_from_ref(props.get("EventBusName", "default"))
+    if error:
+        code, message = error
+        raise ValueError(f"AWS::Events::Rule EventBusName: {code}: {message}")
+    return bus
+
+
 def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(name, bus)
     # The service's own ARN shape: a default-bus rule has no bus segment.
     arn = _eb._rule_arn(name, bus)
@@ -3723,8 +3793,8 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
     name = new_props.get("Name") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )
-    old_bus = old_props.get("EventBusName", "default")
-    new_bus = new_props.get("EventBusName", "default")
+    old_bus = _eb_rule_bus_name(old_props)
+    new_bus = _eb_rule_bus_name(new_props)
     old_key = _eb._rule_key(physical_id, old_bus)
     rule = _eb._rules.get(old_key)
     replaced = _rename_replacement(
@@ -3778,7 +3848,7 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
 
 
 def _eb_rule_delete(physical_id, props):
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(physical_id, bus)
     rule = _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
@@ -3806,7 +3876,12 @@ def _pascal_to_camel(obj):
 def _iot_topic_rule_create(logical_id, props, stack_name):
     name = props.get("RuleName") or _physical_name(stack_name, logical_id).replace("-", "_")
     payload = _pascal_to_camel(props.get("TopicRulePayload", {}))
+    tags = _iot_tags(props)
+    err = _iot._tags_error(tags, required=False)
+    if err:
+        raise ValueError(f"AWS::IoT::TopicRule create failed: {err[2]!r}")
     _iot.put_topic_rule(name, payload)
+    _iot._set_created_tags(_iot._topic_rule_arn(name), tags)
     return name, {"Arn": _iot._topic_rule_arn(name)}
 
 
@@ -3828,6 +3903,7 @@ def _iot_topic_rule_update(physical_id, old_props, new_props, stack_name, logica
         name, payload,
         created_at=existing.get("createdAt") if existing else None,
     )
+    _iot_update_tags(_iot._topic_rule_arn(name), old_props, new_props)
     return name, {"Arn": _iot._topic_rule_arn(name)}
 
 
@@ -6397,22 +6473,28 @@ def _appsync_api_delete(physical_id, props):
     _appsync._delete_graphql_api(physical_id)
 
 
+# The DataSource properties and the CreateDataSource members they become.
+_APPSYNC_DS_MEMBERS = {
+    "Description": "description", "ServiceRoleArn": "serviceRoleArn",
+    "DynamoDBConfig": "dynamodbConfig", "LambdaConfig": "lambdaConfig",
+    "ElasticsearchConfig": "elasticsearchConfig", "OpenSearchServiceConfig": "openSearchServiceConfig",
+    "HttpConfig": "httpConfig", "RelationalDatabaseConfig": "relationalDatabaseConfig",
+    "EventBridgeConfig": "eventBridgeConfig", "MetricsConfig": "metricsConfig",
+}
+
+
 def _appsync_ds_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     name = props.get("Name") or logical_id
-    ds_type = props.get("Type", "NONE")
-    body = {"name": name, "type": ds_type}
-    if props.get("DynamoDBConfig"):
-        body["dynamodbConfig"] = props["DynamoDBConfig"]
-    if props.get("LambdaConfig"):
-        body["lambdaConfig"] = props["LambdaConfig"]
-    if props.get("ServiceRoleArn"):
-        body["serviceRoleArn"] = props["ServiceRoleArn"]
-    _appsync._data_sources.setdefault(api_id, {})[name] = {
-        "name": name, "type": ds_type, **body,
-        "dataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}",
-    }
-    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}"}
+    body = {"name": name, "type": props.get("Type", "NONE")}
+    for prop, member in _APPSYNC_DS_MEMBERS.items():
+        if props.get(prop) not in (None, ""):
+            body[member] = _pascal_to_camel(props[prop])
+    resp = _appsync._create_data_source(api_id, body)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::DataSource create failed: {resp[2]!r}")
+    arn = _appsync._data_sources[api_id][name]["dataSourceArn"]
+    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": arn}
 
 
 def _appsync_ds_delete(physical_id, props):
@@ -6455,22 +6537,29 @@ def _appsync_function_delete(physical_id, props):
     pass
 
 
+# The Resolver properties that become CreateResolver members.
+_APPSYNC_RESOLVER_MEMBERS = (
+    "DataSourceName", "RequestMappingTemplate", "ResponseMappingTemplate", "Kind",
+    "PipelineConfig", "CachingConfig", "SyncConfig", "MaxBatchSize", "Runtime", "Code",
+    "MetricsConfig",
+)
+
+
 def _appsync_resolver_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     type_name = props.get("TypeName", "Query")
     field_name = props.get("FieldName", logical_id)
-    ds_name = props.get("DataSourceName", "")
-    resolver = {
-        "typeName": type_name, "fieldName": field_name,
-        "dataSourceName": ds_name,
-        "resolverArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/types/{type_name}/resolvers/{field_name}",
-    }
-    if props.get("RequestMappingTemplate"):
-        resolver["requestMappingTemplate"] = props["RequestMappingTemplate"]
-    if props.get("ResponseMappingTemplate"):
-        resolver["responseMappingTemplate"] = props["ResponseMappingTemplate"]
-    _appsync._resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = resolver
-    return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": resolver["resolverArn"]}
+    body = {"fieldName": field_name}
+    for prop in _APPSYNC_RESOLVER_MEMBERS:
+        if props.get(prop) not in (None, ""):
+            body[prop[:1].lower() + prop[1:]] = _pascal_to_camel(props[prop])
+    if "maxBatchSize" in body:
+        body["maxBatchSize"] = int(body["maxBatchSize"])
+    resp = _appsync._create_resolver(api_id, type_name, body)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::Resolver create failed: {resp[2]!r}")
+    arn = _appsync._resolvers[api_id][type_name][field_name]["resolverArn"]
+    return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": arn}
 
 
 def _appsync_resolver_delete(physical_id, props):
@@ -6871,14 +6960,14 @@ def _cognito_user_pool_delete(physical_id, props):
 # UpdateUserPoolClient's parameters, with the value a dropped property
 # reverts to: what the service's CreateUserPoolClient fills in when the
 # request omits it, since the resource reference says a parameter without a
-# value is set to its default. None clears AnalyticsConfiguration, which the
-# client record omits on read. RefreshTokenRotation has no field on the
-# record and is not modelled.
+# value is set to its default. None clears AnalyticsConfiguration and the
+# access and ID token validities, which the client record omits on read.
+# RefreshTokenRotation has no field on the record and is not modelled.
 _COGNITO_USER_POOL_CLIENT_UPDATABLE = {
     "ClientName": "",
     "RefreshTokenValidity": 30,
-    "AccessTokenValidity": 60,
-    "IdTokenValidity": 60,
+    "AccessTokenValidity": None,
+    "IdTokenValidity": None,
     "TokenValidityUnits": {},
     "ReadAttributes": [],
     "WriteAttributes": [],
@@ -7208,25 +7297,50 @@ def _cognito_identity_pool_delete(physical_id, props):
 
 # --- Cognito UserPoolDomain ---
 
+def _cognito_user_pool_domain_request(props):
+    """The CreateUserPoolDomain / UpdateUserPoolDomain request a template declares."""
+    request = {"UserPoolId": props.get("UserPoolId", ""), "Domain": props.get("Domain", "")}
+    for key in ("CustomDomainConfig", "Routing"):
+        if key in props:
+            request[key] = props[key]
+    if "ManagedLoginVersion" in props:
+        request["ManagedLoginVersion"] = int(props["ManagedLoginVersion"])
+    return request
+
+
+def _cognito_user_pool_domain_attributes(domain):
+    _, _, body = _cognito._describe_user_pool_domain({"Domain": domain})
+    description = json.loads(body)["DomainDescription"]
+    return {"CloudFrontDistribution": description.get("CloudFrontDistribution", "")}
+
+
 def _cognito_user_pool_domain_create(logical_id, props, stack_name):
     pid = props.get("UserPoolId", "")
     domain = props.get("Domain", "")
     pool = _cognito._user_pools.get(pid)
     if not pool:
         raise ValueError(f"UserPool {pid} not found for UserPoolDomain")
-    pool["Domain"] = domain
-    _cognito._pool_domain_map[domain] = pid
-    phys_id = f"{pid}-domain-{domain}"
-    return phys_id, {}
+    status, _, body = _cognito._create_user_pool_domain(_cognito_user_pool_domain_request(props))
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain create failed: {body!r}")
+    # Ref returns the domain name.
+    return domain, _cognito_user_pool_domain_attributes(domain)
+
+
+def _cognito_user_pool_domain_update(physical_id, old_props, new_props, stack_name):
+    """Apply CustomDomainConfig and ManagedLoginVersion through UpdateUserPoolDomain, which refuses Routing."""
+    request = _cognito_user_pool_domain_request(new_props)
+    status, _, body = _cognito._update_user_pool_domain(request)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain update failed: {body!r}")
+    return physical_id, _cognito_user_pool_domain_attributes(request["Domain"])
 
 
 def _cognito_user_pool_domain_delete(physical_id, props):
     domain = props.get("Domain", "")
-    pid = _cognito._pool_domain_map.pop(domain, None)
-    if pid:
-        pool = _cognito._user_pools.get(pid)
-        if pool:
-            pool["Domain"] = None
+    pid = props.get("UserPoolId", "")
+    if _cognito._pool_domain_map.get(domain) == pid:
+        _cognito._delete_user_pool_domain({"UserPoolId": pid, "Domain": domain})
 
 
 # ===========================================================================
@@ -8762,6 +8876,10 @@ def _lambda_layer_create(logical_id, props, stack_name):
     content = props.get("Content", {})
     s3_bucket = content.get("S3Bucket", "")
     s3_key = content.get("S3Key", "")
+    if s3_bucket and s3_key:
+        region_error = _lambda_svc.s3_code_region_message(s3_bucket, layer=True)
+        if region_error:
+            raise ValueError(region_error)
 
     if layer_name not in _lambda_svc._layers:
         _lambda_svc._layers[layer_name] = {"versions": [], "next_version": 1}
@@ -10299,8 +10417,9 @@ def _apigw_v2_stage_create(logical_id, props, stack_name):
         **_apigw_v2_stage_props(props),
     }
     _apigw_v2._stages.setdefault(api_id, {})[stage_name] = stage
-    physical_id = f"{api_id}/{stage_name}"
-    return physical_id, {"StageName": stage_name}
+    # Ref uses the physical ID and AWS returns only the stage name. ApiId
+    # stays in the resolved properties for update and delete, as for v1 stages.
+    return stage_name, {"StageName": stage_name}
 
 
 def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -10314,13 +10433,15 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     through the service's own API. A property the template drops reverts to
     the create's default. ApiId and StageName require replacement: the new
     stage is created before the old one is removed."""
-    api_id, _, stage_name = physical_id.partition("/")
+    api_id = old_props.get("ApiId", "")
+    stage_name = old_props.get("StageName", "$default")
     stage = _apigw_v2._stages.get(api_id, {}).get(stage_name)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         (new_props.get("ApiId", ""), new_props.get("StageName", "$default")),
         (api_id, stage_name) if stage else None,
         _apigw_v2_stage_create, _apigw_v2_stage_delete,
+        delete_when_id_unchanged=True,
     )
     if replaced is not None:
         return replaced
@@ -10328,15 +10449,16 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     if resp[0] >= 400:
         raise ValueError(f"AWS::ApiGatewayV2::Stage update failed: {resp[2]!r}")
     _reconcile_tag_map(stage.setdefault("tags", {}), old_props, new_props)
+    # Keep legacy api/name physical IDs on in-place updates: changing the ID
+    # alone would make the engine delete the still-current stage as a predecessor.
     return physical_id, {"StageName": stage_name}
 
 
 def _apigw_v2_stage_delete(physical_id, props):
-    parts = physical_id.split("/", 1)
-    if len(parts) == 2:
-        api_id, stage_name = parts
-        stages = _apigw_v2._stages.get(api_id, {})
-        stages.pop(stage_name, None)
+    api_id = props.get("ApiId", "")
+    stage_name = props.get("StageName", "$default")
+    stages = _apigw_v2._stages.get(api_id, {})
+    stages.pop(stage_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -10726,51 +10848,120 @@ def _ses_email_identity_update(physical_id, old_props, new_props, stack_name,
 # SES ConfigurationSet
 # ---------------------------------------------------------------------------
 
+def _ses_configuration_set_members(props):
+    """The SES v2 CreateConfigurationSet members of a template's properties."""
+    members = {k: copy.deepcopy(props[k]) for k in _ses_v2._CONFIG_SET_OPTIONS.values()
+               if isinstance(props.get(k), dict)}
+    for key, member in (("ReputationOptions", "ReputationMetricsEnabled"), ("SendingOptions", "SendingEnabled")):
+        if member in members.get(key, {}):
+            members[key][member] = _cfn_bool(members[key][member])
+    members["Tags"] = [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
+    return members
+
+
 def _ses_configuration_set_create(logical_id, props, stack_name):
-    # AWS::SES::ConfigurationSet Ref returns the configuration set name; when the
-    # template omits Name, CloudFormation generates one from the stack/logical id.
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    """Ref is the set name; a generated name is <LogicalId>- + 12 random letters and digits."""
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    name = props.get("Name") or f"{logical_id[:51]}-{suffix}"
     # Register with both the classic (v1) and v2 SES stores so DescribeConfigurationSet
     # (Query API) and GetConfigurationSet (v2 REST API) both see the set.
     _ses._configuration_sets[name] = {
         "Name": name,
         "CreatedTimestamp": _ses._iso_now(),
     }
-    _ses_v2._config_sets[name] = {"ConfigurationSetName": name, "Tags": []}
+    _ses_v2._create_config_set(name, _ses_configuration_set_members(props))
     # Real AWS AWS::SES::ConfigurationSet supports Ref (the set name) only; it
     # exposes no Fn::GetAtt attributes, so return none.
     return name, {}
 
 
+def _ses_configuration_set_update(physical_id, old_props, new_props, stack_name):
+    """Put every option again, a removed one as a new set has it; a Name change replaces the set."""
+    rec = _ses_v2._config_sets.get(physical_id)
+    if rec is None:
+        return _ses_configuration_set_create(None, {**new_props, "Name": physical_id}, stack_name)
+    members = _ses_configuration_set_members(new_props)
+    for key in _ses_v2._CONFIG_SET_OPTIONS.values():
+        _ses_v2._put_config_set_option(rec, key, members.get(key) or _ses_v2._CONFIG_SET_DEFAULTS.get(key, {}))
+    rec["Tags"] = members["Tags"]
+    _ses_v2._ses_tags[_ses_v2._resource_arn("configuration-set", physical_id)] = list(members["Tags"])
+    return physical_id, {}
+
+
 def _ses_configuration_set_delete(physical_id, props):
     _ses._configuration_sets.pop(physical_id, None)
     _ses_v2._config_sets.pop(physical_id, None)
+    _ses_v2._ses_tags.pop(_ses_v2._resource_arn("configuration-set", physical_id), None)
 
 
 # ---------------------------------------------------------------------------
 # SES ConfigurationSetEventDestination
 # ---------------------------------------------------------------------------
 
+def _ses_v2_enum(value):
+    """A v1 camelCase name as its SES v2 enum value: renderingFailure is RENDERING_FAILURE."""
+    return re.sub(r"([a-z])([A-Z])", r"\1_\2", str(value)).upper()
+
+
+def _ses_event_destination_definition(destination):
+    """The SES v2 EventDestinationDefinition of a template's EventDestination."""
+    definition = {
+        "Enabled": _cfn_bool(destination.get("Enabled", False)),
+        "MatchingEventTypes": [_ses_v2_enum(t) for t in destination.get("MatchingEventTypes") or []],
+    }
+    cloudwatch = destination.get("CloudWatchDestination")
+    if isinstance(cloudwatch, dict):
+        definition["CloudWatchDestination"] = {"DimensionConfigurations": [
+            {**d, "DimensionValueSource": _ses_v2_enum(d.get("DimensionValueSource", ""))}
+            for d in cloudwatch.get("DimensionConfigurations") or []
+        ]}
+    firehose = destination.get("KinesisFirehoseDestination")
+    if isinstance(firehose, dict):
+        definition["KinesisFirehoseDestination"] = {
+            "IamRoleArn": firehose.get("IAMRoleARN"), "DeliveryStreamArn": firehose.get("DeliveryStreamARN")}
+    if isinstance(destination.get("SnsDestination"), dict):
+        definition["SnsDestination"] = {"TopicArn": destination["SnsDestination"].get("TopicARN")}
+    if isinstance(destination.get("EventBridgeDestination"), dict):
+        definition["EventBridgeDestination"] = {
+            "EventBusArn": destination["EventBridgeDestination"].get("EventBusArn")}
+    return definition
+
+
+def _ses_event_destination_put(config_set, dest_name, props, *, create):
+    if config_set not in _ses_v2._config_sets:
+        # A set the v2 store does not know: the destination is not recorded.
+        return
+    err = _ses_v2._put_event_destination(
+        config_set, dest_name, _ses_event_destination_definition(props.get("EventDestination") or {}),
+        create=create)
+    if err:
+        raise ValueError(json.loads(err[2])["message"])
+
+
 def _ses_configuration_set_event_destination_create(logical_id, props, stack_name):
     config_set = props.get("ConfigurationSetName", "")
     destination = props.get("EventDestination", {}) or {}
     dest_name = destination.get("Name") or _physical_name(
         stack_name, logical_id, max_len=64)
-    # Record the event destination against its configuration set (if present) so
-    # the set round-trips with its destinations; the emulator does not deliver
-    # SES events, this is CFN provisioning fidelity only.
-    record = _ses._configuration_sets.get(config_set)
-    if record is not None:
-        record.setdefault("EventDestinations", {})[dest_name] = destination
+    # Recorded through the SES v2 API; the emulator does not deliver SES events.
+    _ses_event_destination_put(config_set, dest_name, props, create=True)
     # The physical id encodes both names so delete can locate the destination.
     return f"{config_set}|{dest_name}", {"Id": dest_name}
 
 
+def _ses_configuration_set_event_destination_update(physical_id, old_props, new_props, stack_name):
+    """Replace the destination's content in place; the physical id keeps its name, as on AWS."""
+    config_set, _, dest_name = physical_id.partition("|")
+    destinations = (_ses_v2._config_sets.get(config_set) or {}).get("EventDestinations") or {}
+    _ses_event_destination_put(config_set, dest_name, new_props, create=dest_name not in destinations)
+    return physical_id, {"Id": dest_name}
+
+
 def _ses_configuration_set_event_destination_delete(physical_id, props):
     config_set, _, dest_name = physical_id.partition("|")
-    record = _ses._configuration_sets.get(config_set)
+    record = _ses_v2._config_sets.get(config_set)
     if record is not None:
-        record.get("EventDestinations", {}).pop(dest_name, None)
+        (record.get("EventDestinations") or {}).pop(dest_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -11919,6 +12110,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
 def _asg_delete(physical_id, props):
     _asg._asgs.pop(physical_id, None)
     _asg._tags.pop(physical_id, None)
+    _asg._delete_group_hooks(physical_id)
     _asg._delete_group_policies(physical_id)
 
 
@@ -11986,17 +12178,17 @@ def _asg_policy_delete(physical_id, props):
 def _asg_hook_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
     hook_name = props.get("LifecycleHookName") or _physical_name(stack_name, logical_id, max_len=255)
-    key = f"{asg_name}/{hook_name}"
-    _asg._hooks[key] = {
-        "LifecycleHookName": hook_name,
-        "AutoScalingGroupName": asg_name,
-        "LifecycleTransition": props.get("LifecycleTransition", "autoscaling:EC2_INSTANCE_LAUNCHING"),
-        "HeartbeatTimeout": int(props.get("HeartbeatTimeout", 3600)),
-        "DefaultResult": props.get("DefaultResult", "ABANDON"),
-        "NotificationTargetARN": props.get("NotificationTargetARN", ""),
-        "RoleARN": props.get("RoleARN", ""),
-    }
+    _asg._hooks[f"{asg_name}/{hook_name}"] = _asg._hook_record(asg_name, hook_name, props)
     return hook_name, {"LifecycleHookName": hook_name}
+
+
+def _asg_hook_update(physical_id, old_props, new_props, stack_name):
+    """AutoScalingGroupName and LifecycleHookName replace; the rest is in place and a dropped member stays."""
+    asg_name = new_props.get("AutoScalingGroupName", "")
+    key = f"{asg_name}/{physical_id}"
+    current = _asg._hooks.get(key, {})
+    _asg._hooks[key] = _asg._hook_record(asg_name, physical_id, {**current, **new_props})
+    return physical_id, {"LifecycleHookName": physical_id}
 
 
 def _asg_hook_delete(physical_id, props):
@@ -12257,10 +12449,14 @@ def _s3tables_table_create(logical_id, props, stack_name):
     schema_field_list = (
         props.get("IcebergMetadata", {}).get("IcebergSchema", {}).get("SchemaFieldList", [])
     )
-    schema_fields = [
-        {"name": f["Name"], "type": f.get("Type", "string"), "required": f.get("Required", False)}
-        for f in schema_field_list
-    ]
+    try:
+        schema_fields = [
+            {"name": f["Name"], "type": _s3tables._iceberg_field_type(f.get("Type", "string")),
+             "required": f.get("Required", False)}
+            for f in schema_field_list
+        ]
+    except ValueError:
+        raise ValueError("The specified metadata is not valid") from None
     iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, schema_fields, location)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     table_arn = _s3tables._table_arn(bucket_arn, namespace, table_name)
@@ -13224,13 +13420,11 @@ def _iot_thing_import(identifier):
 
 
 def _iot_thing_delete(physical_id, props):
-    thing = _iot._things.get(physical_id)
-    if thing is None:
+    if physical_id not in _iot._things:
         return
-    if any(p.rsplit("/", 1)[-1] in _iot._certificates for p in thing.get("principals", [])):
-        raise ValueError(
-            f"Cannot delete. Thing {physical_id} is still attached to one or more principals")
-    _iot._delete_thing(physical_id)
+    resp = _iot._delete_thing(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_certificate_attrs(cert_id):
@@ -13307,16 +13501,9 @@ def _iot_certificate_delete(physical_id, props):
         return
     if cert["status"] == "ACTIVE":
         _iot_certificate_status(physical_id, "INACTIVE")
-    arn = cert["certificateArn"]
-    # The service refuses DeleteCertificate while things are attached, then
-    # while policies are, in that order.
-    if any(_iot._thing_name_from_arn(t) in _iot._things for t in cert.get("attachedThings", [])):
-        raise ValueError(f"Things must be detached before deletion (arn: {arn})")
-    if _iot._policies_attached_to(arn):
-        raise ValueError(f"Certificate policies must be detached before deletion (arn: {arn})")
     resp = _iot._handle_certificate("DELETE", f"/certificates/{physical_id}", b"", {})
     if resp[0] >= 400:
-        raise ValueError(f"AWS::IoT::Certificate delete failed: {resp[2]!r}")
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_thing_principal_attachment_call(method, thing, principal, thing_principal_type=None):
@@ -13368,9 +13555,19 @@ def _iot_policy_principal_attachment_delete(physical_id, props):
 # readable back through its real API instead of the stack rolling back.
 
 
+def _iot_tags(props):
+    """A Tags property as the IoT API's tag list."""
+    return [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
+
+
+def _iot_update_tags(arn, old_props, new_props):
+    _reconcile_tag_map(_iot._tags.setdefault(arn, {}), old_props, new_props)
+
+
 def _iot_thing_type_create(logical_id, props, stack_name):
     name = props.get("ThingTypeName") or _physical_name(stack_name, logical_id)
-    payload = {"thingTypeProperties": _pascal_to_camel(props.get("ThingTypeProperties") or {})}
+    payload = {"thingTypeProperties": _pascal_to_camel(props.get("ThingTypeProperties") or {}),
+               "tags": _iot_tags(props)}
     resp = _iot._create_thing_type(name, payload)
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::ThingType create failed: {resp[2]!r}")
@@ -13392,8 +13589,22 @@ def _iot_thing_type_import(identifier):
     return identifier["ThingTypeName"], _iot_thing_type_attrs(identifier["ThingTypeName"])
 
 
-def _iot_thing_type_delete(physical_id, props):
+def _iot_thing_type_remove(physical_id, props):
+    """Drop the record without the delete checks, for a replacement that reuses the generated name."""
     _iot._thing_types.pop(physical_id, None)
+    _iot._tags.pop(_iot._thing_type_arn(physical_id), None)
+
+
+def _iot_thing_type_delete(physical_id, props):
+    """Deprecate the thing type, then delete it; a type a thing still uses fails the delete and stays deprecated."""
+    record = _iot._thing_types.get(physical_id)
+    if record is None:
+        return
+    if not record["thingTypeMetadata"].get("deprecated"):
+        _iot._deprecate_thing_type(physical_id, {"undoDeprecate": False})
+    resp = _iot._delete_thing_type(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
@@ -13422,7 +13633,7 @@ def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::IoT::ThingType", old_props, new_props):
-        _iot_thing_type_delete(physical_id, old_props)
+        _iot_thing_type_remove(physical_id, old_props)
         return _iot_thing_type_create(logical_id or physical_id, new_props, stack_name)
 
     stored = record.setdefault("thingTypeProperties", {})
@@ -13436,6 +13647,7 @@ def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
         status, _headers, body = _iot._deprecate_thing_type(physical_id, {"undoDeprecate": not deprecate})
         if status >= 400:
             raise ValueError(f"DeprecateThingType failed: {body}")
+    _iot_update_tags(_iot._thing_type_arn(physical_id), old_props, new_props)
     return physical_id, _iot_thing_type_attrs(physical_id)
 
 
@@ -13467,7 +13679,7 @@ def _iot_thing_group_create(logical_id, props, stack_name):
     # anything, whatever the properties (measured eu-central-1, 2026-10-05).
     if name in _iot._thing_groups:
         raise ValueError(f"Resource of type 'AWS::IoT::ThingGroup' with identifier '{name}' already exists.")
-    payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
+    payload = {"thingGroupProperties": _iot_thing_group_properties(props), "tags": _iot_tags(props)}
     if props.get("ParentGroupName"):
         payload["parentGroupName"] = props["ParentGroupName"]
     resp = _iot._create_thing_group(name, payload)
@@ -13484,9 +13696,8 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
     """Update a thing group in place through UpdateThingGroup: ThingGroupProperties
     is the one property the reference marks No interruption that the service
     stores. ThingGroupName and ParentGroupName changes are replaced in
-    ``_update_resource`` before this runs. QueryString and Tags are accepted
-    without effect — the service has no dynamic groups and no tag store for
-    thing groups."""
+    ``_update_resource`` before this runs. Tags go to the tag store; QueryString
+    is accepted without effect, the service has no dynamic groups."""
     rec = _iot_thing_group_record(physical_id)
     if rec is None:
         return _iot_thing_group_create(logical_id or physical_id, new_props, stack_name)
@@ -13495,6 +13706,7 @@ def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logic
         name, {"thingGroupProperties": _iot_thing_group_properties(new_props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::ThingGroup update failed: {resp[2]!r}")
+    _iot_update_tags(rec["thingGroupArn"], old_props, new_props)
     return physical_id, {"Arn": rec["thingGroupArn"], "Id": physical_id}
 
 
@@ -13539,7 +13751,8 @@ def _iot_policy_prune_versions(name):
 
 def _iot_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id)
-    resp = _iot._create_policy(name, {"policyDocument": _iot_policy_document(props)})
+    resp = _iot._create_policy(name, {"policyDocument": _iot_policy_document(props),
+                                      "tags": _iot_tags(props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::Policy create failed: {resp[2]!r}")
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
@@ -13560,12 +13773,14 @@ def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id
         created = _iot_policy_create(logical_id or physical_id, new_props, stack_name)
         _delete_predecessor(_iot_policy_delete, physical_id, old_props)
         return created
-    _iot_policy_prune_versions(name)
-    resp = _iot._create_policy_version(
-        name, {"policyDocument": _iot_policy_document(new_props)}, {"setAsDefault": "true"}
-    )
-    if resp[0] >= 400:
-        raise ValueError(f"AWS::IoT::Policy update failed: {resp[2]!r}")
+    if _iot_policy_document(new_props) != _iot_policy_document(old_props):
+        _iot_policy_prune_versions(name)
+        resp = _iot._create_policy_version(
+            name, {"policyDocument": _iot_policy_document(new_props)}, {"setAsDefault": "true"}
+        )
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::Policy update failed: {resp[2]!r}")
+    _iot_update_tags(_iot._policy_arn(name), old_props, new_props)
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
 
 
@@ -13575,7 +13790,16 @@ def _iot_policy_import(identifier):
 
 
 def _iot_policy_delete(physical_id, props):
-    _iot._policies.pop(physical_id, None)
+    """Delete the non-default versions, then the policy; a policy still attached fails the delete."""
+    policy = _iot._policies.get(physical_id)
+    if policy is None:
+        return
+    for version_id, version in list(policy["versions"].items()):
+        if not version["isDefaultVersion"]:
+            _iot._delete_policy_version(physical_id, version_id)
+    resp = _iot._delete_policy(physical_id)
+    if resp[0] >= 400:
+        raise ValueError(json.loads(resp[2])["message"])
 
 
 def _iot_provisioning_template_body(props):
@@ -13595,7 +13819,7 @@ def _iot_provisioning_template_payload(name, props):
     if "Description" in props:
         payload["description"] = props["Description"]
     if "Enabled" in props:
-        payload["enabled"] = props["Enabled"]
+        payload["enabled"] = _cfn_bool(props["Enabled"])
     if "TemplateType" in props:
         payload["type"] = props["TemplateType"]
     if props.get("PreProvisioningHook"):
@@ -13617,7 +13841,7 @@ def _iot_provisioning_template_create(logical_id, props, stack_name):
         stack_name, logical_id, max_len=36
     )
     resp = _iot._create_provisioning_template(
-        _iot_provisioning_template_payload(name, props)
+        {**_iot_provisioning_template_payload(name, props), "tags": _iot_tags(props)}
     )
     if resp[0] == 409:
         # Re-create of a surviving template (rollback replay re-enters create):
@@ -13638,11 +13862,10 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
     A TemplateName change is a replacement, handled the way AWS::IoT::Policy's
     rename is: the new template is created and the old one removed, since a
     template no stack still declares is not left behind. TemplateBody is not
-    an UpdateProvisioningTemplate member (AWS stores it as a new version via
-    CreateProvisioningTemplateVersion, which MiniStack does not model), so a
-    changed body is written onto the stored record directly — the template
-    always stays at defaultVersionId 1. TemplateType requires replacement,
-    which ``_update_resource`` performs before this runs.
+    an UpdateProvisioningTemplate member: a changed body becomes the new
+    default version, after the oldest is deleted at the version limit.
+    TemplateType requires replacement, which ``_update_resource`` performs
+    before this runs.
     """
     name = new_props.get("TemplateName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=36
@@ -13667,14 +13890,22 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
         raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     body = _iot_provisioning_template_body(new_props)
     tmpl = _iot._provisioning_templates.get(name)
-    if tmpl is not None and body and body != tmpl.get("templateBody"):
+    if tmpl is not None and body and body != _iot._provisioning_template_body(tmpl):
         err = _iot._validate_provisioning_template_body(body)
         if err is not None:
             raise ValueError(
                 f"AWS::IoT::ProvisioningTemplate update failed: {err[2]!r}"
             )
-        tmpl["templateBody"] = body
-        _iot._provisioning_templates[name] = tmpl
+        if len(tmpl["versions"]) >= _iot._PROVISIONING_TEMPLATE_VERSIONS_MAX:
+            oldest = min(v["versionId"] for v in tmpl["versions"].values()
+                         if v["versionId"] != tmpl["defaultVersionId"])
+            _iot._delete_provisioning_template_version(name, str(oldest))
+        resp = _iot._create_provisioning_template_version(
+            name, {"templateBody": body}, {"setAsDefault": "true"}
+        )
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
+    _iot_update_tags(_iot._provisioning_template_arn(name), old_props, new_props)
     return name, _iot_provisioning_template_attrs(name)
 
 
@@ -13775,6 +14006,7 @@ def _iot_ca_certificate_create(logical_id, props, stack_name):
         "verificationCertificate": props.get("VerificationCertificatePem"),
         "certificateMode": props.get("CertificateMode"),
         "registrationConfig": _registration_config_payload(props),
+        "tags": _iot_tags(props),
     }
     resp = _iot._register_ca_certificate(
         {k: v for k, v in payload.items() if v is not None},
@@ -13831,6 +14063,7 @@ def _iot_ca_certificate_update(physical_id, old_props, new_props, stack_name):
             "AWS::IoT::CACertificate cannot change CertificateMode in place: "
             "CloudFormation documents it as update-requires-replacement."
         )
+    _iot_update_tags(_iot._ca_cert_arn(physical_id), old_props, new_props)
     return _iot_ca_certificate_apply(physical_id, new_props)
 
 
@@ -13893,7 +14126,7 @@ def _iot_domain_configuration_create(logical_id, props, stack_name):
         k: v for k, v in props.items()
         if k not in ("DomainConfigurationName", "DomainConfigurationStatus", "Tags")
     })
-    resp = _iot._create_domain_configuration(name, payload)
+    resp = _iot._create_domain_configuration(name, {**payload, "tags": _iot_tags(props)})
     if resp[0] >= 400:
         raise ValueError(f"AWS::IoT::DomainConfiguration create failed: {resp[2]!r}")
     if props.get("DomainConfigurationStatus") != "ENABLED":
@@ -13910,7 +14143,9 @@ def _iot_domain_configuration_update(physical_id, old_props, new_props, stack_na
     })
     if payload:
         _iot_domain_configuration_set(physical_id, payload, "update")
-    return physical_id, _iot_domain_configuration_attrs(physical_id)
+    attrs = _iot_domain_configuration_attrs(physical_id)
+    _iot_update_tags(attrs["Arn"], old_props, new_props)
+    return physical_id, attrs
 
 
 def _iot_domain_configuration_delete(physical_id, props):
@@ -14245,8 +14480,13 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DocDB::DBClusterParameterGroup": ("Description", "Family", "Name"),
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
+    "AWS::AppSync::DataSource": ("ApiId", "Name"),
+    "AWS::AppSync::Resolver": ("ApiId", "TypeName", "FieldName"),
+    # Every GraphQLSchema property is "Update requires: No interruption".
+    "AWS::AppSync::GraphQLSchema": (),
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
+    "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::Thing": ("ThingName",),
     "AWS::IoT::Certificate": (
@@ -14270,6 +14510,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LaunchConfigurationName", "MetadataOptions", "PlacementTenancy", "RamDiskId",
         "SecurityGroups", "SpotPrice", "UserData",
     ),
+    "AWS::AutoScaling::LifecycleHook": ("AutoScalingGroupName", "LifecycleHookName"),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IAM::Role": ("RoleName", "Path"),
     "AWS::IAM::User": ("UserName",),
@@ -14290,6 +14531,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::CertificateManager::Certificate": _ACM_REPLACEMENT_PROPERTIES,
     "AWS::CloudFront::Function": ("Name",),
     "AWS::SSM::Parameter": ("Name",),
+    "AWS::SES::ConfigurationSet": ("Name",),
+    "AWS::SES::ConfigurationSetEventDestination": ("ConfigurationSetName",),
     "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
     "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
     "AWS::Signer::SigningProfile": ("ProfileName", "PlatformId", "SignatureValidityPeriod"),
@@ -14842,7 +15085,11 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_delete,
         "import": _cognito_identity_pool_import,
     },
-    "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
+    "AWS::Cognito::UserPoolDomain": {
+        "create": _cognito_user_pool_domain_create,
+        "update": _cognito_user_pool_domain_update,
+        "delete": _cognito_user_pool_domain_delete,
+    },
     "AWS::ECR::Repository": {
         "create": _ecr_repo_create,
         "update": _ecr_repo_update,
@@ -15079,8 +15326,16 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ses_email_identity_delete,
     },
-    "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
-    "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
+    "AWS::SES::ConfigurationSet": {
+        "create": _ses_configuration_set_create,
+        "update": _ses_configuration_set_update,
+        "delete": _ses_configuration_set_delete,
+    },
+    "AWS::SES::ConfigurationSetEventDestination": {
+        "create": _ses_configuration_set_event_destination_create,
+        "update": _ses_configuration_set_event_destination_update,
+        "delete": _ses_configuration_set_event_destination_delete,
+    },
     "AWS::Signer::SigningProfile": {
         "create": _signer_signing_profile_create,
         "update": _signer_signing_profile_update,
@@ -15331,7 +15586,11 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _asg_policy_delete,
     },
-    "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
+    "AWS::AutoScaling::LifecycleHook": {
+        "create": _asg_hook_create,
+        "update": _asg_hook_update,
+        "delete": _asg_hook_delete,
+    },
     "AWS::AutoScaling::ScheduledAction": {
         "create": _asg_scheduled_create,
         "update": _asg_scheduled_update,

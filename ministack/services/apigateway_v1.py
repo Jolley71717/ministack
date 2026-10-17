@@ -907,6 +907,51 @@ def find_api_scope(api_id):
     return None
 
 
+def rest_api_policy_for_arn(resource_arn):
+    """The REST API's resource policy, ``execute-api:/`` expanded, and owner account, for the identity check."""
+    parts = resource_arn.split(":", 5)
+    if len(parts) < 6 or parts[2] != "execute-api":
+        return None
+    region, account_id, api_id = parts[3], parts[4], parts[5].split("/", 1)[0]
+    home = region
+    api = _rest_apis.get_scoped(account_id, region, api_id)
+    if api is None:
+        # Signed for another region than the API's: its policy still applies, read as the request's ARN.
+        scope = find_api_scope(api_id)
+        if scope is None:
+            return None
+        home = scope[1]
+        api = _rest_apis.get_scoped(account_id, home, api_id) or {}
+    policy = api.get("policy") or ""
+    if not isinstance(policy, str):
+        policy = json.dumps(policy)
+    prefix = f"arn:aws:execute-api:{region}:{account_id}:{api_id}/"
+    policy = policy.replace('"execute-api:/', f'"{prefix}')
+    if home != region:
+        policy = policy.replace(f"arn:aws:execute-api:{home}:{account_id}:{api_id}/", prefix)
+    return policy, account_id
+
+
+def _anonymous_policy_error(api_id, stage_name, method, path, headers, account_id, region):
+    """ACCESS_DENIED for a call without SigV4 that the REST API's resource policy does not allow."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    if not AUTH or _header_ci(headers, "authorization").startswith("AWS4-"):
+        return None
+    arn = execute_api_arn(region, account_id, api_id, stage_name, method, path)
+    policy = (rest_api_policy_for_arn(arn) or ("",))[0]
+    ctx = EvalContext("*", "Anonymous", "", "execute-api:Invoke", arn, region)
+    decision = evaluate_resource_policy(policy, ctx).decision if policy else "Allow"
+    if decision == "Allow":
+        return None
+    reason = ("with an explicit deny in a resource-based policy" if decision == "Deny"
+              else "because no resource-based policy allows the execute-api:Invoke action")
+    shown = arn.replace(f":{account_id}:", f":********{account_id[-4:]}:", 1)
+    return _gw_error("ACCESS_DENIED",
+                     f"User: anonymous is not authorized to perform: execute-api:Invoke on resource: {shown} {reason}")
+
+
 def find_domain_scope(domain_name):
     """Return (account_id, region, stored_name) owning a custom domain within
     the ambient account.
@@ -1416,9 +1461,10 @@ class _GatewayError:
     of ``response_type`` in the stage's deployment (see
     :func:`_gateway_error_response`)."""
 
-    def __init__(self, response_type, message):
+    def __init__(self, response_type, message, error_type=None):
         self.response_type = response_type
         self.message = message
+        self.error_type = error_type
 
 
 def _gw_error(response_type, message):
@@ -1493,7 +1539,7 @@ def _gateway_error_response(error, request):
         value = _gateway_request_value(source, request)
         if value is not None:
             headers[dest[len("gatewayresponse.header."):]] = value
-    error_type = _GATEWAY_RESPONSE_ERROR_TYPES.get(response_type)
+    error_type = error.error_type or _GATEWAY_RESPONSE_ERROR_TYPES.get(response_type)
     if error_type:
         headers["x-amzn-ErrorType"] = error_type
     headers["x-amzn-requestid"] = request["request_id"]
@@ -1521,7 +1567,35 @@ def _gateway_error_response(error, request):
     body = _GATEWAY_TEMPLATE_VARIABLE.sub(
         lambda m: variables.get(m.group(1) or m.group(2), m.group(0)), template
     )
-    return int(response.get("statusCode") or 500), headers, body.encode("utf-8")
+    status = response.get("statusCode") or (403 if response_type == "DEFAULT_4XX" else 500)
+    return int(status), headers, body.encode("utf-8")
+
+
+# A failed SigV4 authentication of an execute-api caller: the gateway response and x-amzn-ErrorType.
+_AUTHENTICATION_GATEWAY_ERRORS = {
+    "SignatureDoesNotMatch": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "RequestTimeTooSkewed": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "ExpiredTokenException": ("EXPIRED_TOKEN", "ExpiredTokenException"),
+    "CredentialDateMismatch": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "IncompleteSignature": ("DEFAULT_4XX", "IncompleteSignatureException"),
+    "MissingAuthorizationParameter": ("DEFAULT_4XX", "IncompleteSignatureException"),
+}
+
+
+def authentication_error_response(api_id, stage_name, error, headers, query_params):
+    """Answer a failed SigV4 authentication through a REST API stage's gateway responses, or None."""
+    scope = find_api_scope(api_id)
+    stage = stages_for_api(api_id).get(stage_name)
+    if scope is None or stage is None:
+        return None
+    response_type, error_type = _AUTHENTICATION_GATEWAY_ERRORS.get(
+        error.code, ("DEFAULT_4XX", "UnrecognizedClientException"))
+    request = {
+        "api_id": api_id, "stage_name": stage_name, "stage": stage, "headers": headers or {},
+        "query_params": query_params or {}, "path_params": {}, "resource_path": "", "request_id": new_uuid(),
+    }
+    with request_scope(*scope):
+        return _gateway_error_response(_GatewayError(response_type, error.message, error_type), request)
 
 
 def _arn_matches(pattern, arn):
@@ -1863,10 +1937,11 @@ async def _authorize_request_v1(
     """
     auth_type = (method_obj.get("authorizationType") or "NONE").upper()
     if auth_type in ("", "NONE"):
-        return None, None
+        return _anonymous_policy_error(
+            api_id, stage_name, method, request_path, headers, owner_account_id, owner_region), None
     if auth_type == "AWS_IAM":
-        # We do not verify SigV4 signatures; match AWS only to the extent that a
-        # request with no Authorization header is rejected as unauthenticated.
+        # Signatures are verified only under AUTH; here match AWS only to the extent
+        # that a request with no Authorization header is rejected as unauthenticated.
         if not _header_ci(headers, "authorization"):
             return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token"), None
         return None, None
@@ -3887,7 +3962,46 @@ def _export_integration(integration):
     return {key: value for key, value in result.items() if value is not None}
 
 
-def _export_operation(method_obj, export_type, include_integrations):
+def _export_security_scheme(authorizer, include_authorizers):
+    """Security scheme for a TOKEN or REQUEST authorizer."""
+    source = authorizer.get("identitySource") or ""
+    authorizer_type = authorizer.get("type") or "TOKEN"
+    name = "Unused"
+    location = "header"
+    if "," not in source:
+        if source.startswith("method.request.header."):
+            name = source.removeprefix("method.request.header.")
+        elif source.startswith("method.request.querystring."):
+            name = source.removeprefix("method.request.querystring.")
+            location = "query"
+
+    scheme = {
+        "type": "apiKey",
+        "name": name,
+        "in": location,
+        "x-amazon-apigateway-authtype": authorizer.get("authType") or "custom",
+    }
+    if not include_authorizers:
+        return scheme
+
+    extension = {
+        "type": authorizer_type.lower(),
+        "authorizerUri": authorizer.get("authorizerUri", ""),
+        "authorizerResultTtlInSeconds": authorizer.get(
+            "authorizerResultTtlInSeconds", _DEFAULT_AUTHORIZER_TTL
+        ),
+    }
+    if authorizer_type == "REQUEST":
+        extension["identitySource"] = source
+    if authorizer_type == "TOKEN" and authorizer.get("identityValidationExpression"):
+        extension["identityValidationExpression"] = authorizer["identityValidationExpression"]
+    if authorizer.get("authorizerCredentials"):
+        extension["authorizerCredentials"] = authorizer["authorizerCredentials"]
+    scheme["x-amazon-apigateway-authorizer"] = extension
+    return scheme
+
+
+def _export_operation(method_obj, export_type, include_integrations, authorizer):
     operation = {"responses": _export_method_responses(method_obj, export_type)}
     if method_obj.get("operationName"):
         operation["operationId"] = method_obj["operationName"]
@@ -3924,8 +4038,14 @@ def _export_operation(method_obj, export_type, include_integrations):
     if export_type == "swagger" and produced_types:
         operation["produces"] = sorted(produced_types)
 
+    # One requirement object: the client must send all these schemes
+    requirement = {}
+    if authorizer:
+        requirement[authorizer["name"]] = []
     if method_obj.get("apiKeyRequired"):
-        operation["security"] = [{"api_key": []}]
+        requirement["api_key"] = []
+    if requirement:
+        operation["security"] = [requirement]
 
     integration = method_obj.get("methodIntegration")
     if include_integrations and integration:
@@ -3951,7 +4071,7 @@ def _get_export_extensions(query_params):
     }
 
 
-def _build_api_export(api_id, stage_name, export_type, include_integrations):
+def _build_api_export(api_id, stage_name, export_type, include_integrations, include_authorizers):
     api = _rest_apis[api_id]
     version = api.get("version") or "1.0"
     info = {"title": api.get("name", "unnamed"), "version": version}
@@ -3961,6 +4081,7 @@ def _build_api_export(api_id, stage_name, export_type, include_integrations):
     schemas = _export_model_schemas(api_id)
     paths = {}
     has_api_key_method = False
+    used_authorizers = {}
     for resource in _resources.get(api_id, {}).values():
         exported_methods = {}
         for http_method, method_obj in resource.get("resourceMethods", {}).items():
@@ -3969,21 +4090,32 @@ def _build_api_export(api_id, stage_name, export_type, include_integrations):
                 if http_method.upper() == "ANY"
                 else http_method.lower()
             )
+            authorizer = None
+            if method_obj.get("authorizationType") == "CUSTOM":
+                authorizer = _authorizers_v1.get(api_id, {}).get(method_obj.get("authorizerId"))
+            if authorizer:
+                used_authorizers[authorizer["name"]] = authorizer
             exported_methods[method_key] = _export_operation(
-                method_obj, export_type, include_integrations
+                method_obj, export_type, include_integrations, authorizer
             )
             has_api_key_method = has_api_key_method or bool(method_obj.get("apiKeyRequired"))
         if exported_methods:
             paths[resource.get("path", "/")] = exported_methods
 
+    # AWS exports only the authorizers that methods use
+    security_schemes = {
+        name: _export_security_scheme(authorizer, include_authorizers)
+        for name, authorizer in used_authorizers.items()
+    }
+    if has_api_key_method:
+        security_schemes["api_key"] = {"type": "apiKey", "name": "x-api-key", "in": "header"}
+
     region = get_region()
     execute_url = f"https://{api_id}.execute-api.{region}.amazonaws.com/{stage_name}"
     if export_type == "oas30":
         components = {"schemas": schemas}
-        if has_api_key_method:
-            components["securitySchemes"] = {
-                "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
-            }
+        if security_schemes:
+            components["securitySchemes"] = security_schemes
         return {
             "openapi": "3.0.1",
             "info": info,
@@ -4001,10 +4133,8 @@ def _build_api_export(api_id, stage_name, export_type, include_integrations):
         "paths": paths,
         "definitions": schemas,
     }
-    if has_api_key_method:
-        document["securityDefinitions"] = {
-            "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
-        }
+    if security_schemes:
+        document["securityDefinitions"] = security_schemes
     return document
 
 
@@ -4038,7 +4168,8 @@ def _get_export(api_id, stage_name, export_type, headers, query_params):
 
     export_extensions = _get_export_extensions(query_params)
     include_integrations = bool({"integrations", "apigateway"} & export_extensions)
-    document = _build_api_export(api_id, stage_name, export_type, include_integrations)
+    include_authorizers = bool({"authorizers", "apigateway"} & export_extensions)
+    document = _build_api_export(api_id, stage_name, export_type, include_integrations, include_authorizers)
     if extension == "json":
         body = json.dumps(document, ensure_ascii=False).encode("utf-8")
     else:
