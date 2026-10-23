@@ -940,3 +940,270 @@ def test_subscription_captures_selection_before_runner_and_pruning(subscription_
             assert events[0]["ContinuationSequenceNumber"] == appended
 
     asyncio.run(exercise())
+
+
+# ---------------------------------------------------------------------------
+# Resource policies and cross-account event source mappings
+# ---------------------------------------------------------------------------
+
+_PRODUCER = "111111111111"
+_CONSUMER = "222222222222"
+_ESM_READ_ACTIONS = [
+    "kinesis:DescribeStream", "kinesis:DescribeStreamSummary",
+    "kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:ListShards",
+]
+
+
+def _account_client(service, account_id, region="us-east-1"):
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    return boto3.client(
+        service, endpoint_url=endpoint, region_name=region,
+        aws_access_key_id=account_id, aws_secret_access_key="test",
+        config=Config(retries={"total_max_attempts": 1}),
+    )
+
+
+def _read_policy(stream_arn, principal, actions=_ESM_READ_ACTIONS):
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": principal},
+            "Action": actions,
+            "Resource": stream_arn,
+        }],
+    })
+
+
+def _error_code(exc_info):
+    return exc_info.value.response["Error"]["Code"]
+
+
+def test_kinesis_resource_policy_put_get_delete(kin):
+    name = f"kin-rp-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    policy = _read_policy(arn, f"arn:aws:iam::{_CONSUMER}:role/consumer-role")
+
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+    assert json.loads(kin.get_resource_policy(ResourceARN=arn)["Policy"]) == json.loads(policy)
+
+    kin.delete_resource_policy(ResourceARN=arn)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    with pytest.raises(ClientError) as exc:
+        kin.delete_resource_policy(ResourceARN=arn)
+    assert _error_code(exc) == "ResourceNotFoundException"
+
+
+def test_kinesis_resource_policy_errors(kin):
+    name = f"kin-rp-err-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    missing = arn.rsplit("/", 1)[0] + "/no-such-stream"
+
+    with pytest.raises(ClientError) as exc:
+        kin.put_resource_policy(ResourceARN=missing, Policy=_read_policy(missing, _CONSUMER))
+    assert _error_code(exc) == "ResourceNotFoundException"
+
+    for bad in ("not json", "[]", json.dumps({"Version": "2012-10-17"})):
+        with pytest.raises(ClientError) as exc:
+            kin.put_resource_policy(ResourceARN=arn, Policy=bad)
+        assert _error_code(exc) == "InvalidArgumentException"
+
+    # Only the owner's account manages the policy (botocore docs for PutResourcePolicy).
+    other = _account_client("kinesis", _CONSUMER)
+    with pytest.raises(ClientError) as exc:
+        other.put_resource_policy(ResourceARN=arn, Policy=_read_policy(arn, _CONSUMER))
+    assert _error_code(exc) == "AccessDeniedException"
+
+
+def test_kinesis_resource_policy_follows_stream_and_consumer_lifecycle(kin):
+    name = f"kin-rp-life-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    consumer_arn = kin.register_stream_consumer(StreamARN=arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    consumer_policy = _read_policy(consumer_arn, _CONSUMER, ["kinesis:SubscribeToShard"])
+
+    kin.put_resource_policy(ResourceARN=consumer_arn, Policy=consumer_policy)
+    assert json.loads(kin.get_resource_policy(ResourceARN=consumer_arn)["Policy"]) == json.loads(consumer_policy)
+    kin.deregister_stream_consumer(ConsumerARN=consumer_arn)
+    consumer_arn = kin.register_stream_consumer(StreamARN=arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    assert kin.get_resource_policy(ResourceARN=consumer_arn)["Policy"] == "{}"
+
+    kin.put_resource_policy(ResourceARN=arn, Policy=_read_policy(arn, _CONSUMER))
+    kin.delete_stream(StreamName=name)
+    kin.create_stream(StreamName=name, ShardCount=1)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+
+def test_kinesis_resource_policies_persist_per_account():
+    stream_arn = f"arn:aws:kinesis:us-west-2:{_PRODUCER}:stream/persisted"
+    policy = _read_policy(stream_arn, _CONSUMER)
+    saved = kinesis.get_state()
+    try:
+        kinesis.reset()
+        kinesis._resource_policies.set_scoped(_PRODUCER, "us-west-2", stream_arn, policy)
+        state = kinesis.get_state()
+        kinesis.reset()
+        kinesis.load_persisted_state(state)
+        assert kinesis._resource_policies.get_scoped(_PRODUCER, "us-west-2", stream_arn) == policy
+    finally:
+        kinesis.reset()
+        kinesis.load_persisted_state(saved)
+
+
+def test_kinesis_stream_policy_allows_esm_reads_only_when_every_read_is_granted():
+    stream_arn = f"arn:aws:kinesis:us-east-1:{_PRODUCER}:stream/granted"
+    session = f"arn:aws:sts::{_CONSUMER}:assumed-role/consumer-role/consumer-fn"
+    saved = kinesis.get_state()
+    try:
+        kinesis.reset()
+        kinesis._streams.set_scoped(_PRODUCER, "us-east-1", "granted", {
+            "StreamName": "granted", "StreamARN": stream_arn, "StreamStatus": "ACTIVE", "shards": {},
+        })
+
+        def allows():
+            return kinesis.stream_policy_allows_read(stream_arn, session, _CONSUMER)
+
+        assert not allows()  # no policy
+        for principal, expected in (
+            (f"arn:aws:iam::{_CONSUMER}:role/consumer-role", True),
+            (_CONSUMER, True),
+            (f"arn:aws:iam::{_CONSUMER}:role/other-role", False),
+        ):
+            kinesis._resource_policies.set_scoped(
+                _PRODUCER, "us-east-1", stream_arn, _read_policy(stream_arn, principal))
+            assert allows() is expected, principal
+        kinesis._resource_policies.set_scoped(_PRODUCER, "us-east-1", stream_arn, _read_policy(
+            stream_arn, _CONSUMER, ["kinesis:GetRecords", "kinesis:GetShardIterator"]))
+        assert not allows()  # DescribeStream and ListShards missing
+    finally:
+        kinesis.reset()
+        kinesis.load_persisted_state(saved)
+
+
+def _cross_account_setup(region="us-east-1", stream_region=None):
+    """A stream in the producer account and a function in the consumer account."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    producer = _account_client("kinesis", _PRODUCER, stream_region or region)
+    lam_consumer = _account_client("lambda", _CONSUMER, region)
+    stream = f"xacct-{suffix}"
+    producer.create_stream(StreamName=stream, ShardCount=1)
+    stream_arn = producer.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    function = f"xacct-fn-{suffix}"
+    # Under AUTH=true CreateFunction needs the execution role to exist.
+    iam = _account_client("iam", _CONSUMER, region)
+    try:
+        iam.create_role(RoleName="consumer-role", AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                           "Action": "sts:AssumeRole"}],
+        }))
+    except iam.exceptions.EntityAlreadyExistsException:
+        pass
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return len(event['Records'])\n")
+    lam_consumer.create_function(
+        FunctionName=function, Runtime="python3.12", Handler="index.handler",
+        Role=f"arn:aws:iam::{_CONSUMER}:role/consumer-role", Code={"ZipFile": buf.getvalue()},
+    )
+    return SimpleNamespace(producer=producer, lam=lam_consumer, stream=stream,
+                           stream_arn=stream_arn, function=function)
+
+
+def test_lambda_create_esm_accepts_another_accounts_stream_in_the_same_region():
+    s = _cross_account_setup()
+    try:
+        esm = s.lam.create_event_source_mapping(
+            FunctionName=s.function, EventSourceArn=s.stream_arn, StartingPosition="TRIM_HORIZON")
+        assert esm["EventSourceArn"] == s.stream_arn
+        s.lam.delete_event_source_mapping(UUID=esm["UUID"])
+
+        missing = s.stream_arn.rsplit("/", 1)[0] + "/no-such-stream"
+        with pytest.raises(ClientError) as exc:
+            s.lam.create_event_source_mapping(
+                FunctionName=s.function, EventSourceArn=missing, StartingPosition="TRIM_HORIZON")
+        assert _error_code(exc) == "InvalidParameterValueException"
+    finally:
+        s.lam.delete_function(FunctionName=s.function)
+        s.producer.delete_stream(StreamName=s.stream)
+
+
+def test_lambda_create_esm_rejects_another_accounts_stream_in_another_region():
+    s = _cross_account_setup(stream_region="us-west-2")
+    try:
+        with pytest.raises(ClientError) as exc:
+            s.lam.create_event_source_mapping(
+                FunctionName=s.function, EventSourceArn=s.stream_arn, StartingPosition="TRIM_HORIZON")
+        assert _error_code(exc) == "InvalidParameterValueException"
+        assert "same region" in exc.value.response["Error"]["Message"]
+    finally:
+        s.lam.delete_function(FunctionName=s.function)
+        s.producer.delete_stream(StreamName=s.stream)
+
+
+def _wait_for_result(lam_client, esm_uuid, predicate, timeout=20):
+    deadline = time.time() + timeout
+    result = ""
+    while time.time() < deadline:
+        result = lam_client.get_event_source_mapping(UUID=esm_uuid).get("LastProcessingResult", "")
+        if predicate(result):
+            return result
+        time.sleep(0.5)
+    return result
+
+
+@pytest.mark.auth_contract
+def test_lambda_cross_account_kinesis_esm_delivery_contract(auth_enabled):
+    """Records reach another account's function; under AUTH=true only while the
+    stream's resource policy grants the function's execution role the reads."""
+    s = _cross_account_setup()
+    esm = s.lam.create_event_source_mapping(
+        FunctionName=s.function, EventSourceArn=s.stream_arn, StartingPosition="TRIM_HORIZON", BatchSize=10)
+    try:
+        s.producer.put_record(StreamName=s.stream, Data=b"first", PartitionKey="pk")
+        if auth_enabled:
+            result = _wait_for_result(s.lam, esm["UUID"], lambda r: r.startswith("PROBLEM"))
+            assert result.startswith("PROBLEM: Lambda is not authorized to read"), result
+
+            role = f"arn:aws:iam::{_CONSUMER}:role/consumer-role"
+            s.producer.put_resource_policy(ResourceARN=s.stream_arn, Policy=_read_policy(s.stream_arn, role))
+        result = _wait_for_result(s.lam, esm["UUID"], lambda r: r.startswith("OK"))
+        assert result == "OK - 1 records", result
+
+        if auth_enabled:
+            # The policy is evaluated on every pass, so revoking it stops delivery.
+            s.producer.delete_resource_policy(ResourceARN=s.stream_arn)
+            s.producer.put_record(StreamName=s.stream, Data=b"second", PartitionKey="pk")
+            result = _wait_for_result(s.lam, esm["UUID"], lambda r: r.startswith("PROBLEM"))
+            assert result.startswith("PROBLEM"), result
+    finally:
+        s.lam.delete_event_source_mapping(UUID=esm["UUID"])
+        s.lam.delete_function(FunctionName=s.function)
+        s.producer.delete_stream(StreamName=s.stream)
+
+
+@pytest.mark.auth_contract
+def test_kinesis_stream_policy_grants_a_named_user_contract(auth_enabled, iam_user, kin):
+    """In the owner's account, a stream policy naming a user allows that user
+    even without an identity policy."""
+    name = f"kin-rp-auth-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    user = iam_user()
+    client = user.client("kinesis")
+    try:
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                client.describe_stream_summary(StreamARN=arn)
+            assert _error_code(exc) == "AccessDeniedException"
+        else:
+            client.describe_stream_summary(StreamARN=arn)
+
+        kin.put_resource_policy(ResourceARN=arn, Policy=_read_policy(
+            arn, user.arn, ["kinesis:DescribeStreamSummary"]))
+        assert client.describe_stream_summary(StreamARN=arn)["StreamDescriptionSummary"]["StreamARN"] == arn
+    finally:
+        kin.delete_stream(StreamName=name)
