@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import zlib
@@ -47,7 +48,7 @@ ITERATOR_EXPIRY_SECONDS = 300
 _streams = AccountRegionScopedDict()
 _shard_iterators = AccountRegionScopedDict()
 _consumers = AccountRegionScopedDict()
-_resource_policies = AccountRegionScopedDict()  # stream or consumer ARN -> policy document as sent
+_resource_policies = AccountRegionScopedDict()  # stream or consumer ARN -> policy document as AWS stores it
 # (ConsumerARN, ShardId) -> {"id", "started"} of the live SubscribeToShard
 _subscriptions = {}
 SUBSCRIPTION_SECONDS = 300
@@ -406,9 +407,9 @@ async def handle_request(method, path, headers, body, query_params):
         "StopStreamEncryption": _stop_stream_encryption,
         "EnableEnhancedMonitoring": _enable_enhanced_monitoring,
         "DisableEnhancedMonitoring": _disable_enhanced_monitoring,
-        "PutResourcePolicy": _put_resource_policy,
-        "GetResourcePolicy": _get_resource_policy,
-        "DeleteResourcePolicy": _delete_resource_policy,
+        "PutResourcePolicy": lambda d: _put_resource_policy(d, headers),
+        "GetResourcePolicy": lambda d: _get_resource_policy(d, headers),
+        "DeleteResourcePolicy": lambda d: _delete_resource_policy(d, headers),
     }
 
     handler = handlers.get(action)
@@ -1420,110 +1421,56 @@ def _cbor_response(data: dict, status: int = 200):
 # Resource policies (codes and messages as AWS answered them, us-east-1, 2026-10-26)
 # ---------------------------------------------------------------------------
 
-# The actions a policy may share (Kinesis Data Streams developer guide, "Controlling access", and
-# DescribeStream, which its cross-account Lambda section says to include).
-_POLICY_ACTIONS = {
-    "stream": {"kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:GetRecords",
-               "kinesis:GetShardIterator", "kinesis:ListShards", "kinesis:PutRecord", "kinesis:PutRecords"},
-    "consumer": {"kinesis:DescribeStreamConsumer", "kinesis:SubscribeToShard"},
-}
+_RESOURCE_ARN_RE = re.compile(r"^arn:aws[^:]*:kinesis:[^:]*:\d{12}:stream/[^/]+(/consumer/[^/]+:\d+)?$")
 
 
-def _statement_positions(text):
-    """(line, column) of each Statement entry's opening brace, 1-based, in document order."""
-    decoder = json.JSONDecoder()
-    depth, i, n = 0, 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == '"':
-            key, end = json.decoder.scanstring(text, i + 1)
-            j = end
-            while j < n and text[j] in " \t\r\n":
-                j += 1
-            if depth == 1 and key == "Statement" and j < n and text[j] == ":":
-                j += 1
-                while j < n and text[j] in " \t\r\n":
-                    j += 1
-                starts = []
-                if j < n and text[j] == "[":
-                    j += 1
-                    while j < n:
-                        while j < n and text[j] in " \t\r\n,":
-                            j += 1
-                        if j >= n or text[j] == "]":
-                            break
-                        starts.append(j)
-                        _value, j = decoder.raw_decode(text, j)
-                else:
-                    starts.append(j)
-                return [(text.count("\n", 0, k) + 1, k - (text.rfind("\n", 0, k) + 1) + 1) for k in starts]
-            i = end
-            continue
-        if ch in "{[":
-            depth += 1
-        elif ch in "}]":
-            depth -= 1
-        i += 1
-    return []
+def _policy_target(resource_arn):
+    """The stream or registered consumer a resource policy attaches to, in the caller's account and region."""
+    return _resolve_stream_by_arn(resource_arn) or _consumer_from_arn(resource_arn)
 
 
-def _policy_error(text, resource_arn, kind):
-    """The validation message AWS gives a policy for this resource, or None."""
-    try:
-        document = json.loads(text)
-    except (TypeError, ValueError):
-        return "This policy contains invalid Json"
-    if not isinstance(document, dict):
-        return "This policy contains invalid Json"
-    for field in ("Version", "Statement"):
-        if field not in document:
-            return f"Missing required field {field}"
-    statements = document["Statement"]
-    statements = statements if isinstance(statements, list) else [statements]
-    positions = _statement_positions(text)
-    for index, statement in enumerate(statements):
-        if not isinstance(statement, dict):
-            continue
-        line, column = positions[index] if index < len(positions) else (1, 1)
-        where = f"Resource policy contains invalid statement at line {line}, column {column}: "
-        actions = statement.get("Action", [])
-        actions = actions if isinstance(actions, list) else [actions]
-        invalid = [a for a in actions if a not in _POLICY_ACTIONS[kind]]
-        if invalid:
-            return where + "The following action names are invalid: " + ", ".join(f'"{a}"' for a in invalid)
-        resources = statement.get("Resource", [])
-        resources = resources if isinstance(resources, list) else [resources]
-        if any(r != resource_arn for r in resources):
-            return where + "The resource policy's resource must be the same as the resource ARN."
-    return None
+def _not_found(resource_arn):
+    """ResourceNotFoundException for a stream or consumer ARN, in AWS's words."""
+    account_id = resource_arn.split(":")[4]
+    stream_name, _, consumer = resource_arn.split(":stream/", 1)[1].partition("/consumer/")
+    if consumer:
+        consumer_name, _, created = consumer.rpartition(":")
+        message = (f"Consumer {consumer_name} with creation timestamp {created} under stream {stream_name} "
+                   f"and account {account_id} not found.")
+    else:
+        message = f"Stream {stream_name} under account {account_id} not found."
+    return error_response_json("ResourceNotFoundException", message, 400)
 
 
-def _policy_resource(resource_arn, policy=None):
-    """(kind, error): checks the ARN's region and account, then the policy, then that the resource exists."""
-    try:
-        spec = parse_arn(resource_arn or "")
-    except ArnParseError:
-        spec = None
-    if spec is None or spec.service != "kinesis" or not spec.resource.startswith("stream/"):
-        return None, error_response_json("InvalidArgumentException", f"Invalid ARN: {resource_arn}", 400)
-    if spec.region != get_region():
-        return None, error_response_json(
+def _policy_resource_error(resource_arn, action, headers):
+    """The error for a ResourceARN outside the caller's reach, or None: the ARN's shape, then its
+    region, then its account. Another account that exists answers AccessDeniedException (no policy
+    can grant the resource-policy actions); one that does not, UnrecognizedClientException."""
+    if not isinstance(resource_arn, str) or not _RESOURCE_ARN_RE.match(resource_arn):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{resource_arn}' at 'resourceARN' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: arn:aws.*:kinesis:.*:\\d{12}:.*(stream|channel|queue)/\\S+",
+            400,
+        )
+    account_id, region = _kinesis_arn_scope(resource_arn)
+    if region != get_region():
+        return error_response_json(
             "InvalidArgumentException",
             f"The region specified in the ARN '{resource_arn}' does not match the endpoint region", 400)
-    if spec.account_id != get_account_id():
-        return None, error_response_json("UnrecognizedClientException", "No account found for the given parameters", 400)
-    kind = "consumer" if "/consumer/" in spec.resource else "stream"
-    if policy is not None:
-        message = _policy_error(policy, resource_arn, kind)
-        if message:
-            return None, error_response_json("InvalidArgumentException", f"Policy validation error: {message}", 400)
-    if kind == "stream" and not _resolve_stream_by_arn(resource_arn):
-        name = spec.resource.split("/", 1)[1]
-        return None, error_response_json(
-            "ResourceNotFoundException", f"Stream {name} under account {get_account_id()} not found.", 400)
-    if kind == "consumer" and not _consumer_from_arn(resource_arn):
-        return None, error_response_json("ResourceNotFoundException", f"Consumer {resource_arn} not found", 400)
-    return kind, None
+    if account_id != get_account_id():
+        from ministack.core.accounts import account_exists
+        from ministack.services.sts import _caller_identity
+
+        if not account_exists(account_id):
+            return error_response_json("UnrecognizedClientException", "No account found for the given parameters", 400)
+        identity = _caller_identity(headers)
+        caller = identity.get("userArn") if isinstance(identity, dict) else f"arn:aws:iam::{get_account_id()}:root"
+        return error_response_json(
+            "AccessDeniedException",
+            f"User: {caller} is not authorized to perform: kinesis:{action} on resource: {resource_arn} "
+            f"because no resource-based policy allows the kinesis:{action} action", 400)
+    return None
 
 
 def stream_policy_for_arn(resource_arn):
@@ -1560,28 +1507,45 @@ def mapping_read_denied(stream_arn, role_arn, function_name, mapping_account):
     return None
 
 
-def _put_resource_policy(data):
-    resource_arn, policy = data.get("ResourceARN"), data.get("Policy")
-    _kind, err = _policy_resource(resource_arn, policy if isinstance(policy, str) else "")
+def _put_resource_policy(data, headers):
+    resource_arn = data.get("ResourceARN")
+    err = _policy_resource_error(resource_arn, "PutResourcePolicy", headers)
     if err:
         return err
-    _resource_policies[resource_arn] = policy
+    from ministack.core.accounts import principal_exists
+    from ministack.services import kinesis_resource_policy as rp
+
+    try:
+        root, statements = rp.validate(data.get("Policy"), resource_arn, "/consumer/" in resource_arn)
+    except rp.PolicyError as exc:
+        return error_response_json("InvalidArgumentException", str(exc), 400)
+    if rp.statement_has_no_principals(statements):
+        return error_response_json("InvalidArgumentException", rp.EMPTY_PRINCIPALS, 400)
+    if not all(principal_exists(p) for p in rp.aws_principals(statements)):
+        return error_response_json("InvalidArgumentException", "Invalid principal in policy document.", 400)
+    if _policy_target(resource_arn) is None:
+        return _not_found(resource_arn)
+    _resource_policies[resource_arn] = rp.normalize(root, statements)
     return json_response({})
 
 
-def _get_resource_policy(data):
+def _get_resource_policy(data, headers):
     resource_arn = data.get("ResourceARN")
-    _kind, err = _policy_resource(resource_arn)
+    err = _policy_resource_error(resource_arn, "GetResourcePolicy", headers)
     if err:
         return err
+    if _policy_target(resource_arn) is None:
+        return _not_found(resource_arn)
     return json_response({"Policy": _resource_policies.get(resource_arn) or "{}"})
 
 
-def _delete_resource_policy(data):
+def _delete_resource_policy(data, headers):
     resource_arn = data.get("ResourceARN")
-    _kind, err = _policy_resource(resource_arn)
+    err = _policy_resource_error(resource_arn, "DeleteResourcePolicy", headers)
     if err:
         return err
+    if _policy_target(resource_arn) is None:
+        return _not_found(resource_arn)
     if resource_arn not in _resource_policies:
         return error_response_json(
             "ResourceNotFoundException", f"No resource policy found for resource ARN {resource_arn}.", 400)

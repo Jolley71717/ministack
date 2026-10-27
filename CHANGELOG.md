@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Kinesis — resource policies are validated and stored as AWS does** — `PutResourcePolicy` accepted most invalid documents. It now runs Kinesis's checks in AWS's order with its messages (size, JSON, `Version`, `Statement`, required and prohibited fields, `Sid`, actions per stream or consumer, wildcard and non-AWS principals, one `Resource` equal to the ARN) and refuses principals that do not exist. `GetResourcePolicy` returns the document compact, as AWS stores it. Another account's ARN answers `AccessDeniedException` when the account is in use and `UnrecognizedClientException` when it is not, and Kinesis authorization denials name the stream.
+
 ## [1.5.33] — 2026-10-26
 
 ### Added
