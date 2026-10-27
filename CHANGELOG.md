@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Lambda — cross-account Kinesis mappings follow AWS's access checks** — `CreateEventSourceMapping` on another account's stream now checks the stream's policy in both auth modes, as AWS does: the function's role needs `DescribeStream`, `DescribeStreamSummary`, `GetRecords`, `GetShardIterator` and `ListShards`, and a missing stream or grant answers AWS's `Cannot access stream ...` message. A running mapping needs only `GetRecords`; without it the mapping stops and reports AWS's `PROBLEM: User: ... is not authorized to perform ...` result (naming `DescribeStream` when the whole grant is gone), and resumes when the grant returns. A mapping on a missing stream in its own account answers `Stream not found`.
 - **Kinesis — resource policies are validated and stored as AWS does** — `PutResourcePolicy` accepted most invalid documents. It now runs Kinesis's checks in AWS's order with its messages (size, JSON, `Version`, `Statement`, required and prohibited fields, `Sid`, actions per stream or consumer, wildcard and non-AWS principals, one `Resource` equal to the ARN) and refuses principals that do not exist. `GetResourcePolicy` returns the document compact, as AWS stores it. Another account's ARN answers `AccessDeniedException` when the account is in use and `UnrecognizedClientException` when it is not, and Kinesis authorization denials name the stream.
 
 ## [1.5.33] — 2026-10-26
