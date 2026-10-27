@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — event source mappings answer as AWS does** — a Kinesis or DynamoDB Streams mapping now reports AWS's defaults (`BatchSize` 100, `MaximumRetryAttempts` and `MaximumRecordAgeInSeconds` -1, `BisectBatchOnFunctionError` false, `ParallelizationFactor` 1, `TumblingWindowInSeconds` 0, `DestinationConfig` `{"OnFailure": {}}`), `StateTransitionReason` `User action`, and `LastProcessingResult` `OK` or `PROBLEM: Function call failed` instead of `OK - N records` and `FAILED`. An SQS mapping has no `LastProcessingResult`, as on AWS. Create, update and delete answer the transitional state (`Creating`, `Updating`, `Enabling`, `Disabling`, `Deleting`), `UpdateEventSourceMapping` answers 202, a second mapping for the same source and function is refused with `ResourceConflictException`, and an unknown mapping's message is AWS's. MiniStack's states settle at once, where AWS's SQS mappings stay `Creating` for a few seconds.
+
 ## [1.5.33] — 2026-10-26
 
 ### Added
