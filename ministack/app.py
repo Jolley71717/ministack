@@ -3881,9 +3881,6 @@ def _reset_all_state():
         except Exception as e:
             logger.warning("reset() failed for %s: %s", mod_name, e)
 
-    from ministack.core import accounts
-    accounts.reset()
-
     S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
     S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
 

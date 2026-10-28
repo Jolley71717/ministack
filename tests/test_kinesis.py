@@ -1179,12 +1179,12 @@ def _read_policy(stream_arn, principal, actions=("kinesis:DescribeStream", "kine
 
 
 def _use_account(account_id):
-    """An account exists, for Kinesis and policy principals, once it is in use."""
-    _account_client("sts", account_id).get_caller_identity()
+    """MiniStack knows an account once it holds an IAM identity or a stream; give it a role."""
+    _consumer_role(account=account_id)
 
 
-def _consumer_role(name="consumer-role"):
-    iam = _account_client("iam", _CONSUMER)
+def _consumer_role(name="consumer-role", account=_CONSUMER):
+    iam = _account_client("iam", account)
     try:
         iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({
             "Version": "2012-10-17",
@@ -1193,7 +1193,7 @@ def _consumer_role(name="consumer-role"):
         }))
     except iam.exceptions.EntityAlreadyExistsException:
         pass
-    return f"arn:aws:iam::{_CONSUMER}:role/{name}"
+    return f"arn:aws:iam::{account}:role/{name}"
 
 
 def _new_stream(kin, prefix):
