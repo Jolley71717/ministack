@@ -882,3 +882,81 @@ def test_scheduler_tag_apis_reject_invalid_resource_arns_before_touching_tags(
     _assert_error(resp, expected_status, expected_code)
     assert scheduler_mod._tags.get(good_arn, {}) == baseline
     assert scheduler_mod._tags.get(arn) is None
+
+
+def test_scheduler_schedule_error_messages(scheduler):
+    """Real AWS (us-east-1, #2467 r2 q12/q13/q15/q16/q17): schedule messages do not name the group."""
+    import uuid as _uuid
+
+    group = f"msg-grp-{_uuid.uuid4().hex[:8]}"
+    name, missing = f"msg-{_uuid.uuid4().hex[:8]}", f"msg-missing-{_uuid.uuid4().hex[:8]}"
+    scheduler.create_schedule_group(Name=group)
+    common = {
+        "GroupName": group,
+        "ScheduleExpression": "at(2030-01-01T00:00:00)",
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "Target": {"Arn": "arn:aws:sqs:us-east-1:000000000000:q", "RoleArn": "arn:aws:iam::000000000000:role/r"},
+    }
+    try:
+        scheduler.create_schedule(Name=name, **common)
+        calls = [
+            (lambda: scheduler.get_schedule(Name=missing, GroupName=group), "ResourceNotFoundException",
+             f"Schedule {missing} does not exist."),
+            (lambda: scheduler.create_schedule(Name=name, **common), "ConflictException",
+             f"Schedule {name} already exists."),
+            (lambda: scheduler.update_schedule(Name=missing, **common), "ResourceNotFoundException",
+             f"Schedule {missing} does not exist."),
+            (lambda: scheduler.delete_schedule(Name=missing, GroupName=group), "ResourceNotFoundException",
+             f"Schedule {missing} does not exist."),
+            (lambda: scheduler.get_schedule(Name=name), "ResourceNotFoundException",
+             f"Schedule {name} does not exist."),
+        ]
+        for call, code, message in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == code
+            assert exc.value.response["Error"]["Message"] == message
+    finally:
+        scheduler.delete_schedule_group(Name=group)
+
+
+def test_scheduler_event_bus_target_uses_eventbridge_parameters(scheduler):
+    """#2466: a schedule whose target is an event bus publishes with the Source and DetailType of
+    its EventBridgeParameters, and Input as the detail, so a rule matching them sees the event."""
+    import datetime as _dt
+    import json as _json
+
+    kw = dict(endpoint_url=ENDPOINT, aws_access_key_id="test", aws_secret_access_key="test", region_name=REGION)
+    sqs, events = boto3.client("sqs", **kw), boto3.client("events", **kw)
+    bus = f"sched-bus-{_uid()}"
+    bus_arn = events.create_event_bus(Name=bus)["EventBusArn"]
+    q_url = sqs.create_queue(QueueName=f"sched-bus-q-{_uid()}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    events.put_rule(Name="obs", EventBusName=bus,
+                    EventPattern=_json.dumps({"source": ["my.source"], "detail-type": ["delayed-event-publish"]}))
+    events.put_targets(Rule="obs", EventBusName=bus, Targets=[{"Id": "1", "Arn": q_arn}])
+    name = f"fire-bus-{_uid()}"
+    past = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    scheduler.create_schedule(
+        Name=name, ScheduleExpression=f"at({past})", FlexibleTimeWindow={"Mode": "OFF"},
+        Target={"Arn": bus_arn, "RoleArn": "arn:aws:iam::000000000000:role/r",
+                "EventBridgeParameters": {"DetailType": "delayed-event-publish", "Source": "my.source"},
+                "Input": _json.dumps({"run": "x"})})
+    try:
+        deadline, event = time.time() + 20, None
+        while time.time() < deadline and event is None:
+            msgs = sqs.receive_message(QueueUrl=q_url, WaitTimeSeconds=1, MaxNumberOfMessages=1).get("Messages", [])
+            if msgs:
+                event = _json.loads(msgs[0]["Body"])
+        assert event is not None, "the rule matching EventBridgeParameters never saw the event"
+        assert (event["source"], event["detail-type"], event["detail"]) == (
+            "my.source", "delayed-event-publish", {"run": "x"})
+    finally:
+        try:
+            scheduler.delete_schedule(Name=name)
+        except ClientError:
+            pass
+        events.remove_targets(Rule="obs", EventBusName=bus, Ids=["1"])
+        events.delete_rule(Name="obs", EventBusName=bus)
+        events.delete_event_bus(Name=bus)
+        sqs.delete_queue(QueueUrl=q_url)

@@ -1186,12 +1186,12 @@ def _read_policy(stream_arn, principal, actions=("kinesis:DescribeStream", "kine
 
 
 def _use_account(account_id):
-    """An account exists, for Kinesis and policy principals, once it is in use."""
-    _account_client("sts", account_id).get_caller_identity()
+    """MiniStack knows an account once it holds an IAM identity or a stream; give it a role."""
+    _consumer_role(account=account_id)
 
 
-def _consumer_role(name="consumer-role"):
-    iam = _account_client("iam", _CONSUMER)
+def _consumer_role(name="consumer-role", account=_CONSUMER):
+    iam = _account_client("iam", account)
     try:
         iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({
             "Version": "2012-10-17",
@@ -1200,7 +1200,7 @@ def _consumer_role(name="consumer-role"):
         }))
     except iam.exceptions.EntityAlreadyExistsException:
         pass
-    return f"arn:aws:iam::{_CONSUMER}:role/{name}"
+    return f"arn:aws:iam::{account}:role/{name}"
 
 
 def _new_stream(kin, prefix):
@@ -1296,14 +1296,6 @@ _POLICY_CASES = {
                                  '"Resource": "{arn}"}\n  ]\n}',
                                  "Policy validation error: Resource policy contains invalid statement at line 4, "
                                  "column {col}: The Statement Ids in the policy are not unique"),
-    "unknown account principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
-                                  '"Principal": {"AWS": "arn:aws:iam::%(unused)s:root"}, '
-                                  '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
-                                  "Invalid principal in policy document."),
-    "missing role principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
-                               '"Principal": {"AWS": "arn:aws:iam::%(acct)s:role/no-such-role"}, '
-                               '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
-                               "Invalid principal in policy document."),
 }
 
 
@@ -1323,6 +1315,26 @@ def test_kinesis_resource_policy_validation_matches_aws(kin, case):
         kin.put_resource_policy(ResourceARN=arn, Policy=document)
     assert exc.value.response["Error"] == {"Code": "InvalidArgumentException", "Message": message}
     assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("principal", ["arn:aws:iam::{unused}:root", "arn:aws:iam::{acct}:role/no-such-role"])
+def test_kinesis_resource_policy_principal_must_exist_under_auth(kin, auth_enabled, principal):
+    """Under AUTH=true a principal MiniStack does not hold is refused, as AWS refuses one that does not exist;
+    with AUTH off it is stored, as MiniStack does not require roles to exist elsewhere."""
+    _name, arn = _new_stream(kin, "kin-rp-princ")
+    _use_account(_CONSUMER)
+    principal = principal.format(unused=_unused_account(), acct=_CONSUMER)
+    policy = _read_policy(arn, principal, ["kinesis:GetRecords"])
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+        assert exc.value.response["Error"] == {"Code": "InvalidArgumentException",
+                                               "Message": "Invalid principal in policy document."}
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    else:
+        kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+        assert principal in kin.get_resource_policy(ResourceARN=arn)["Policy"]
 
 
 def test_kinesis_resource_policy_resource_errors(kin):

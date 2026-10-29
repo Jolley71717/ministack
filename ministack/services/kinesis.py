@@ -1423,56 +1423,312 @@ def _cbor_response(data: dict, status: int = 200):
 # Resource policies (codes and messages as AWS answered them, us-east-1, 2026-10-26)
 # ---------------------------------------------------------------------------
 
-_RESOURCE_ARN_RE = re.compile(r"^arn:aws[^:]*:kinesis:[^:]*:\d{12}:stream/[^/]+(/consumer/[^/]+:\d+)?$")
+# The actions a policy may share (Kinesis Data Streams developer guide, "Controlling access", and
+# DescribeStream, which its cross-account Lambda section says to include).
+_POLICY_ACTIONS = {
+    "stream": {"kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:GetRecords",
+               "kinesis:GetShardIterator", "kinesis:ListShards", "kinesis:PutRecord", "kinesis:PutRecords"},
+    "consumer": {"kinesis:DescribeStreamConsumer", "kinesis:SubscribeToShard"},
+}
+_POLICY_ACTIONS_LOWER = {kind: {a.lower() for a in actions} for kind, actions in _POLICY_ACTIONS.items()}
+_STATEMENT_FIELDS = ("Sid", "Effect", "Principal", "Action", "Resource", "Condition")
+_CONDITION_OPERATORS = {op.lower() for op in (
+    "StringEquals", "StringNotEquals", "StringEqualsIgnoreCase", "StringNotEqualsIgnoreCase", "StringLike",
+    "StringNotLike", "NumericEquals", "NumericNotEquals", "NumericLessThan", "NumericLessThanEquals",
+    "NumericGreaterThan", "NumericGreaterThanEquals", "DateEquals", "DateNotEquals", "DateLessThan",
+    "DateLessThanEquals", "DateGreaterThan", "DateGreaterThanEquals", "Bool", "BinaryEquals", "IpAddress",
+    "NotIpAddress", "ArnEquals", "ArnLike", "ArnNotEquals", "ArnNotLike", "Null")}
+_NO_PRINCIPALS = ("Invalid policy document: aws.auth.client.error.ARCInvalidArgumentException: "
+                  "com.amazon.balsa.error.InvalidPolicyException: The passed in policy has a statement with no principals!")
 
 
-def _policy_target(resource_arn):
-    """The stream or registered consumer a resource policy attaches to, in the caller's account and region."""
-    return _resolve_stream_by_arn(resource_arn) or _consumer_from_arn(resource_arn)
+def _skip_ws(text, i):
+    while i < len(text) and text[i] in " \t\r\n":
+        i += 1
+    return i
 
 
-def _not_found(resource_arn):
-    """ResourceNotFoundException for a stream or consumer ARN, in AWS's words."""
-    account_id = resource_arn.split(":")[4]
-    stream_name, _, consumer = resource_arn.split(":stream/", 1)[1].partition("/consumer/")
-    if consumer:
-        consumer_name, _, created = consumer.rpartition(":")
-        message = (f"Consumer {consumer_name} with creation timestamp {created} under stream {stream_name} "
-                   f"and account {account_id} not found.")
-    else:
-        message = f"Stream {stream_name} under account {account_id} not found."
-    return error_response_json("ResourceNotFoundException", message, 400)
+def _members(text, i):
+    """(key, value_start, value_end) for each member of the JSON object starting at text[i]."""
+    decoder, out = json.JSONDecoder(), []
+    i = _skip_ws(text, i + 1)
+    while i < len(text) and text[i] == '"':
+        key, i = json.decoder.scanstring(text, i + 1)
+        i = _skip_ws(text, _skip_ws(text, i) + 1)
+        _value, end = decoder.raw_decode(text, i)
+        out.append((key, i, end))
+        i = _skip_ws(text, end)
+        if i < len(text) and text[i] == ",":
+            i = _skip_ws(text, i + 1)
+    return out
 
 
-def _policy_resource_error(resource_arn, action, headers):
-    """The error for a ResourceARN outside the caller's reach, or None: the ARN's shape, then its
-    region, then its account. Another account that exists answers AccessDeniedException (no policy
-    can grant the resource-policy actions); one that does not, UnrecognizedClientException."""
-    if not isinstance(resource_arn, str) or not _RESOURCE_ARN_RE.match(resource_arn):
-        return error_response_json(
+def _line_col(text, offset):
+    """1-based (line, column) of *offset*. CRLF, CR and LF each end a line."""
+    head = text[:offset].replace("\r\n", "\n").replace("\r", "\n")
+    return head.count("\n") + 1, len(head) - (head.rfind("\n") + 1) + 1
+
+
+def _statement_positions(text):
+    """For each Statement entry: the offset AWS reports it at (just past the "[", "{" or previous
+    entry's "}" before it) and the entry's (key, value_start, value_end) members."""
+    decoder = json.JSONDecoder()
+    for key, start, end in _members(text, _skip_ws(text, 0)):
+        if key != "Statement":
+            continue
+        if text[start] == "{":
+            return [(start + 1, _members(text, start))]
+        out, i, pre = [], _skip_ws(text, start + 1), start + 1
+        while i < end and text[i] != "]":
+            _value, item_end = decoder.raw_decode(text, i)
+            out.append((pre, _members(text, i) if text[i] == "{" else []))
+            pre = item_end
+            i = _skip_ws(text, item_end)
+            if i < end and text[i] == ",":
+                i = _skip_ws(text, i + 1)
+        return out
+    return []
+
+
+def _as_list(value):
+    return value if isinstance(value, list) else [value]
+
+
+def _reject_constant(name):
+    raise ValueError(name)
+
+
+def _policy_error(text, resource_arn, kind):
+    """(message, parsed): AWS's validation message for this policy, or None with (document, statements).
+    Checks run in the order Kinesis runs them (recorded in us-east-1)."""
+    size = len(text.encode("utf-8"))
+    if size == 0 or size > 20000:
+        return "Resource policy size should be greater than 0 and less than 20000 bytes", None
+    try:
+        document = json.loads(text, parse_constant=_reject_constant)
+    except (TypeError, ValueError):
+        return "This policy contains invalid Json", None
+    if not isinstance(document, dict):
+        return "This policy contains invalid Json", None
+    if "Version" not in document:
+        return "Missing required field Version", None
+    if document["Version"] not in ("2012-10-17", "2008-10-17"):
+        return "The policy must contain a valid version string", None
+    unknown = [k for k in document if k not in ("Version", "Id", "Statement")]
+    if unknown:
+        return f"Unknown field {unknown[0]}", None
+    if "Statement" not in document:
+        return "Missing required field Statement", None
+    statements = document["Statement"]
+    if isinstance(statements, list) and not statements:
+        return "Could not parse the policy: Statement is empty!", None
+    if not isinstance(statements, (list, dict)):
+        return "Could not parse the policy: Statement is not well formatted.", None
+    statements = _as_list(statements)
+    positions = _statement_positions(text)
+
+    def syntax(offset):
+        return "Syntax error at position ({},{})".format(*_line_col(text, offset))
+
+    # Fields and their types, statement by statement.
+    for statement, (_pre, members) in zip(statements, positions):
+        if not isinstance(statement, dict):
+            return "Could not parse the policy: Statement is not well formatted.", None
+        span = {key: (start, end) for key, start, end in members}
+
+        def read_end(key):
+            # Where the parser stands after reading the field's value.
+            start, end = span[key]
+            return start + 1 if text[start] in "{[" else end
+
+        for key in statement:
+            if key in ("NotPrincipal", "NotAction", "NotResource"):
+                return f"Has prohibited field {key}", None
+            if key not in _STATEMENT_FIELDS:
+                return syntax(span[key][0] + 1), None
+        if "Sid" in statement and not isinstance(statement["Sid"], str):
+            return syntax(read_end("Sid")), None
+        for field in ("Effect", "Principal", "Action", "Resource"):
+            if field not in statement:
+                return f"Missing required field {field}", None
+        if not isinstance(statement["Effect"], str):
+            return syntax(read_end("Effect")), None
+        if statement["Effect"] not in ("Allow", "Deny"):
+            return f"Invalid effect: {statement['Effect']}", None
+        principal = statement["Principal"]
+        if isinstance(principal, str) and principal != "*":
+            return syntax(span["Principal"][1]), None
+        if not isinstance(principal, (str, dict)) or (isinstance(principal, dict) and not all(
+                isinstance(v, str) or (isinstance(v, list) and all(isinstance(x, str) for x in v))
+                for v in principal.values())):
+            return syntax(read_end("Principal")), None
+        for field in ("Action", "Resource"):
+            value = statement[field]
+            if not (isinstance(value, str) or (isinstance(value, list) and all(isinstance(x, str) for x in value))):
+                return syntax(read_end(field)), None
+        actions = _as_list(statement["Action"])
+        if not actions:
+            return "Missing required field Action cannot be empty!", None
+        if any(a != "*" and ":" not in a for a in actions):
+            return "Could not parse vendor in action", None
+        condition = statement.get("Condition")
+        if condition is not None:
+            if not isinstance(condition, dict):
+                return syntax(read_end("Condition")), None
+            for operator in condition:
+                base = operator.split(":", 1)[-1]
+                base = base[:-len("IfExists")] if base.endswith("IfExists") else base
+                if base.lower() not in _CONDITION_OPERATORS:
+                    return f"Invalid Condition type : {operator}", None
+
+    # The rules AWS reports at a statement's position, in its order.
+    for statement, (pre, _members) in zip(statements, positions):
+        where = "Resource policy contains invalid statement at line {}, column {}: ".format(*_line_col(text, pre))
+        sid = statement.get("Sid")
+        if sid is not None and not re.fullmatch(r"[A-Za-z0-9]*", sid):
+            return where + f"The following Statement Ids are invalid: {sid}, ", None
+        actions = _as_list(statement["Action"])
+        if any(a != "*" and a.split(":", 1)[0].lower() != "kinesis" for a in actions):
+            return where + "Action field includes AWS services that are inconsistent with specified vendor", None
+        wildcards = [a for a in actions if "*" in a or "?" in a]
+        if wildcards:
+            return where + f"The resource policy cannot contain invalid actions: [{', '.join(wildcards)}].", None
+        invalid = [a for a in actions if a.lower() not in _POLICY_ACTIONS_LOWER[kind]]
+        if invalid:
+            return where + "The following action names are invalid: " + ", ".join(f'"{a}"' for a in invalid), None
+        principal = statement["Principal"]
+        if principal == "*" or (isinstance(principal, dict) and "*" in _as_list(principal.get("AWS", []))):
+            return where + "The resource policy cannot contain the wildcard principal.", None
+        for principal_kind in (principal if isinstance(principal, dict) else {}):
+            if principal_kind != "AWS":
+                return where + f"The resource policy cannot contain {principal_kind} principals.", None
+        resources = _as_list(statement["Resource"])
+        if len(resources) != 1:
+            return where + "The resource policy must contain exactly one resource.", None
+        if resources[0] != resource_arn:
+            return where + "The resource policy's resource must be the same as the resource ARN.", None
+    seen = set()
+    for statement, (pre, _members) in zip(statements, positions):
+        sid = statement.get("Sid")
+        if sid and sid in seen:
+            return ("Resource policy contains invalid statement at line {}, column {}: "
+                    "The Statement Ids in the policy are not unique").format(*_line_col(text, pre)), None
+        if sid:
+            seen.add(sid)
+    return None, (document, statements)
+
+
+def _account_exists(account_id):
+    """Whether MiniStack knows the account: the caller's own, or one that holds an IAM identity or a
+    Kinesis stream. AWS answers from its real account list, which MiniStack does not have."""
+    from ministack.services import iam
+
+    if account_id == get_account_id():
+        return True
+    stores = (iam._roles._data, iam._users._data, _streams._data)
+    return any(key[0] == account_id for store in stores for key in list(store))
+
+
+def _principal_exists(principal):
+    """An AWS principal names an account that exists, or an IAM role or user by its exact ARN."""
+    from ministack.services import iam
+
+    m = re.fullmatch(r"(\d{12})|arn:aws:iam::(\d{12}):root", principal)
+    if m:
+        return _account_exists(m.group(1) or m.group(2))
+    m = re.fullmatch(r"arn:aws:iam::(\d{12}):(role|user)/.+", principal)
+    if not m:
+        return False
+    store = iam._roles if m.group(2) == "role" else iam._users
+    return any(key[0] == m.group(1) and isinstance(rec, dict) and rec.get("Arn") == principal
+               for key, rec in list(store._data.items()))
+
+
+def _stored_policy(document, statements):
+    """The document as GetResourcePolicy returns it on AWS: compact, in AWS's key order, with one-item
+    lists collapsed, account ids as root ARNs and repeated principals dropped. AWS's order of several
+    principals changes between calls; this keeps the order they were sent in."""
+    def one_or_list(values):
+        return values[0] if len(values) == 1 else values
+
+    def condition_value(value):
+        return one_or_list([("true" if x else "false") if isinstance(x, bool)
+                            else str(x) if isinstance(x, (int, float)) else x for x in _as_list(value)])
+
+    out_statements = []
+    for statement in statements:
+        out = {}
+        if "Sid" in statement:
+            out["Sid"] = statement["Sid"]
+        out["Effect"] = statement["Effect"]
+        out["Principal"] = {kind: one_or_list(list(dict.fromkeys(
+            f"arn:aws:iam::{name}:root" if re.fullmatch(r"\d{12}", name) else name
+            for name in _as_list(names)))) for kind, names in statement["Principal"].items()}
+        out["Action"] = one_or_list(_as_list(statement["Action"]))
+        out["Resource"] = _as_list(statement["Resource"])[0]
+        if "Condition" in statement:
+            out["Condition"] = {op: {k: condition_value(v) for k, v in keys.items()}
+                                for op, keys in statement["Condition"].items()}
+        out_statements.append(out)
+    stored = {"Version": document["Version"]}
+    if "Id" in document:
+        stored["Id"] = document["Id"]
+    stored["Statement"] = out_statements
+    return json.dumps(stored, separators=(",", ":"), ensure_ascii=False)
+
+
+def _policy_resource(resource_arn, action, headers, policy=None):
+    """(kind, error, stored): checks the ARN, its region and account, then the policy and its
+    principals, then that the resource exists, in AWS's order."""
+    if not isinstance(resource_arn, str) or not re.fullmatch(
+            r"arn:aws[^:]*:kinesis:[^:]*:\d{12}:stream/[^/]+(/consumer/[^/]+:\d+)?", resource_arn):
+        return None, error_response_json(
             "ValidationException",
             f"1 validation error detected: Value '{resource_arn}' at 'resourceARN' failed to satisfy constraint: "
             "Member must satisfy regular expression pattern: arn:aws.*:kinesis:.*:\\d{12}:.*(stream|channel|queue)/\\S+",
-            400,
-        )
-    account_id, region = _kinesis_arn_scope(resource_arn)
-    if region != get_region():
-        return error_response_json(
+            400), None
+    spec = parse_arn(resource_arn)
+    if spec.region != get_region():
+        return None, error_response_json(
             "InvalidArgumentException",
-            f"The region specified in the ARN '{resource_arn}' does not match the endpoint region", 400)
-    if account_id != get_account_id():
-        from ministack.core.accounts import account_exists
+            f"The region specified in the ARN '{resource_arn}' does not match the endpoint region", 400), None
+    if spec.account_id != get_account_id():
+        if not _account_exists(spec.account_id):
+            return None, error_response_json(
+                "UnrecognizedClientException", "No account found for the given parameters", 400), None
         from ministack.services.sts import _caller_identity
 
-        if not account_exists(account_id):
-            return error_response_json("UnrecognizedClientException", "No account found for the given parameters", 400)
         identity = _caller_identity(headers)
         caller = identity.get("userArn") if isinstance(identity, dict) else f"arn:aws:iam::{get_account_id()}:root"
-        return error_response_json(
+        return None, error_response_json(
             "AccessDeniedException",
             f"User: {caller} is not authorized to perform: kinesis:{action} on resource: {resource_arn} "
-            f"because no resource-based policy allows the kinesis:{action} action", 400)
-    return None
+            f"because no resource-based policy allows the kinesis:{action} action", 400), None
+    kind = "consumer" if "/consumer/" in spec.resource else "stream"
+    stored = None
+    if policy is not None:
+        message, parsed = _policy_error(policy, resource_arn, kind)
+        if message:
+            return None, error_response_json("InvalidArgumentException", f"Policy validation error: {message}", 400), None
+        document, statements = parsed
+        if any(isinstance(v, list) and not v for s in statements for v in s["Principal"].values()):
+            return None, error_response_json("InvalidArgumentException", _NO_PRINCIPALS, 400), None
+        principals = [n for s in statements for v in s["Principal"].values() for n in _as_list(v)]
+        from ministack.app import AUTH
+        # With AUTH off a principal need not exist in MiniStack, as elsewhere (Lambda takes any role ARN).
+        if AUTH and not all(_principal_exists(p) for p in principals):
+            return None, error_response_json("InvalidArgumentException", "Invalid principal in policy document.", 400), None
+        stored = _stored_policy(document, statements)
+    stream_name, _, consumer = spec.resource.split("/", 1)[1].partition("/consumer/")
+    if kind == "stream" and not _resolve_stream_by_arn(resource_arn):
+        return None, error_response_json(
+            "ResourceNotFoundException", f"Stream {stream_name} under account {spec.account_id} not found.", 400), None
+    if kind == "consumer" and not _consumer_from_arn(resource_arn):
+        consumer_name, _, created = consumer.rpartition(":")
+        return None, error_response_json(
+            "ResourceNotFoundException", f"Consumer {consumer_name} with creation timestamp {created} under stream "
+            f"{stream_name} and account {spec.account_id} not found.", 400), None
+    return kind, None, stored
 
 
 def stream_policy_for_arn(resource_arn):
@@ -1541,44 +1797,28 @@ def running_mapping_read_problem(stream_arn, role_arn, mapping_account):
 
 
 def _put_resource_policy(data, headers):
-    resource_arn = data.get("ResourceARN")
-    err = _policy_resource_error(resource_arn, "PutResourcePolicy", headers)
+    resource_arn, policy = data.get("ResourceARN"), data.get("Policy")
+    _kind, err, stored = _policy_resource(resource_arn, "PutResourcePolicy", headers,
+                                          policy if isinstance(policy, str) else "")
     if err:
         return err
-    from ministack.core.accounts import principal_exists
-    from ministack.services import kinesis_resource_policy as rp
-
-    try:
-        root, statements = rp.validate(data.get("Policy"), resource_arn, "/consumer/" in resource_arn)
-    except rp.PolicyError as exc:
-        return error_response_json("InvalidArgumentException", str(exc), 400)
-    if rp.statement_has_no_principals(statements):
-        return error_response_json("InvalidArgumentException", rp.EMPTY_PRINCIPALS, 400)
-    if not all(principal_exists(p) for p in rp.aws_principals(statements)):
-        return error_response_json("InvalidArgumentException", "Invalid principal in policy document.", 400)
-    if _policy_target(resource_arn) is None:
-        return _not_found(resource_arn)
-    _resource_policies[resource_arn] = rp.normalize(root, statements)
+    _resource_policies[resource_arn] = stored
     return json_response({})
 
 
 def _get_resource_policy(data, headers):
     resource_arn = data.get("ResourceARN")
-    err = _policy_resource_error(resource_arn, "GetResourcePolicy", headers)
+    _kind, err, _stored = _policy_resource(resource_arn, "GetResourcePolicy", headers)
     if err:
         return err
-    if _policy_target(resource_arn) is None:
-        return _not_found(resource_arn)
     return json_response({"Policy": _resource_policies.get(resource_arn) or "{}"})
 
 
 def _delete_resource_policy(data, headers):
     resource_arn = data.get("ResourceARN")
-    err = _policy_resource_error(resource_arn, "DeleteResourcePolicy", headers)
+    _kind, err, _stored = _policy_resource(resource_arn, "DeleteResourcePolicy", headers)
     if err:
         return err
-    if _policy_target(resource_arn) is None:
-        return _not_found(resource_arn)
     if resource_arn not in _resource_policies:
         return error_response_json(
             "ResourceNotFoundException", f"No resource policy found for resource ARN {resource_arn}.", 400)

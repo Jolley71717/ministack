@@ -40,7 +40,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import jsonata
@@ -138,6 +138,7 @@ _executions = AccountRegionScopedDict()
 _HISTORY_TOKEN_TTL_SECONDS = 24 * 60 * 60
 _history_page_tokens = {}
 _history_page_tokens_lock = threading.Lock()
+_events_lock = threading.Lock()
 _task_tokens = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _activities = AccountRegionScopedDict()
@@ -1432,14 +1433,16 @@ def _invalid_tag_resource_arn(arn):
 # ---------------------------------------------------------------------------
 
 def _add_event(execution, event_type, details=None):
-    event = {
-        "id": len(execution["events"]) + 1,
-        "type": event_type,
-        "timestamp": now_iso(),
-    }
-    if details:
-        event.update(details)
-    execution["events"].append(event)
+    # Map items and Parallel branches add events from several threads
+    with _events_lock:
+        event = {
+            "id": len(execution["events"]) + 1,
+            "type": event_type,
+            "timestamp": now_iso(),
+        }
+        if details:
+            event.update(details)
+        execution["events"].append(event)
     return event
 
 
@@ -1801,10 +1804,7 @@ def _run_execution(exec_arn):
             "Id": execution["stateMachineArn"],
             "Name": sm["name"],
         },
-        # JSONata workflow variables — bound via state `Assign` fields and
-        # referenced as `$name` in subsequent JSONata expressions. Scope is
-        # the whole execution (per AWS); Map/Parallel sub-branches share
-        # this dict with the parent, matching AWS semantics.
+        # Workflow variables set by `Assign`; Map items and Parallel branches get a copy
         "variables": {},
     }
 
@@ -1916,10 +1916,11 @@ def _execute_pass(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
-    result = state_def.get("Result", effective)
-    result = _apply_result_selector(state_def, result)
+    assignment_result = state_def.get("Result", effective)
+    result = _apply_result_selector(state_def, assignment_result)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, effective, ctx, result=assignment_result)
     return output, _next_or_end(state_def)
 
 
@@ -1964,6 +1965,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, raw_input, result)
                     output = _apply_output_path(state_def, output, ctx)
+                    _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
                 return output, _next_or_end(state_def)
 
     if is_callback:
@@ -2025,6 +2027,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 result = _apply_result_selector(state_def, task_result)
                 output = _apply_result_path(state_def, raw_input, result)
                 output = _apply_output_path(state_def, output, ctx)
+                _apply_state_assign(state_def, raw_input, ctx, result=task_result)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -2304,11 +2307,15 @@ def _execute_choice(state_def, raw_input, ctx=None):
 
     for choice in state_def.get("Choices", []):
         if _evaluate_rule(choice, effective, ctx):
-            return _apply_output_path(state_def, effective, ctx), choice["Next"]
+            output = _apply_output_path(state_def, effective, ctx)
+            _apply_state_assign(choice, effective, ctx)
+            return output, choice["Next"]
 
     default = state_def.get("Default")
     if default:
-        return _apply_output_path(state_def, effective, ctx), default
+        output = _apply_output_path(state_def, effective, ctx)
+        _apply_state_assign(state_def, effective, ctx)
+        return output, default
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
@@ -2331,6 +2338,14 @@ def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
 def _resolve_path_or_ctx(path, data, ctx):
     if path.startswith("$$."):
         return _resolve_ctx_path(path, ctx or {})
+    if path.startswith("$") and len(path) > 1 and path[1] not in ".[":
+        match = re.match(r"^\$([^.[\s]+)(.*)$", path)
+        if match:
+            name, suffix = match.groups()
+            variables = (ctx or {}).get("variables", {})
+            if name not in variables:
+                raise _ExecutionError("States.Runtime", f"Undefined workflow variable: {name}")
+            return _resolve_path("$" + suffix, variables[name])
     return _resolve_path(path, data)
 
 
@@ -2455,6 +2470,7 @@ def _execute_wait(state_def, raw_input, ctx=None):
             _sleep_until(ts_str)
 
     output = _apply_output_path(state_def, effective, ctx)
+    _apply_state_assign(state_def, effective, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2574,7 +2590,7 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
             results[idx] = _run_sub_machine(
                 branch.get("States", {}),
                 branch.get("StartAt"),
-                effective, execution, ctx)
+                effective, execution, copy.deepcopy(ctx))
         except Exception as exc:
             errors[idx] = exc
 
@@ -2604,6 +2620,7 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
@@ -2687,6 +2704,7 @@ def _run_map_items(state_def, raw_input, execution, ctx):
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
@@ -2850,6 +2868,7 @@ def _run_distributed_map(state_def, raw_input, effective, iterator, execution, c
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
@@ -2870,9 +2889,23 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
         state_type = state_def.get("Type")
         ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
+        _add_event(execution, f"{state_type}StateEntered", {
+            "stateEnteredEventDetails": {
+                "name": current_name,
+                "input": json.dumps(current_input),
+            },
+        })
+
         if state_type == "Succeed":
-            return _apply_output_path(state_def,
-                                      _apply_input_path(state_def, current_input, ctx), ctx)
+            current_input = _apply_input_path(state_def, current_input, ctx)
+            current_input = _apply_output_path(state_def, current_input, ctx)
+            _add_event(execution, "SucceedStateExited", {
+                "stateExitedEventDetails": {
+                    "name": current_name,
+                    "output": json.dumps(current_input),
+                },
+            })
+            return current_input
         if state_type == "Fail":
             raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
@@ -2890,11 +2923,19 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 "States.Runtime", f"Unknown state type: {state_type}")
 
         if state_type in ("Task", "Parallel", "Map"):
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, execution, ctx)
         else:
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, ctx)
+
+        _add_event(execution, f"{state_type}StateExited", {
+            "stateExitedEventDetails": {
+                "name": current_name,
+                "output": json.dumps(current_input),
+            },
+        })
+        current_name = next_name
 
     return current_input
 
@@ -2980,7 +3021,7 @@ def _apply_jsonata_output(state_def, raw_input, ctx=None, result=None, error_out
 
 
 def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=None):
-    """Evaluate a state's `Assign` field (JSONata only) and merge results
+    """Evaluate a state's JSONPath or JSONata `Assign` field and merge results
     into ``ctx['variables']`` so later JSONata expressions can reference them
     as ``$name``. Variables are execution-scoped per AWS.
 
@@ -2989,17 +3030,23 @@ def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=Non
     """
     if ctx is None:
         return
-    if _state_query_language(state_def, ctx) != "JSONata":
-        return
     assign = state_def.get("Assign")
     if not isinstance(assign, dict):
         return
     variables = ctx.setdefault("variables", {})
-    for name, template in assign.items():
-        variables[name] = _apply_jsonata_template(
-            template, raw_input, ctx,
-            result=result, error_output=error_output,
-        )
+    if _state_query_language(state_def, ctx) == "JSONata":
+        assigned = {
+            name: _apply_jsonata_template(template, raw_input, ctx,
+                                          result=result, error_output=error_output)
+            for name, template in assign.items()
+        }
+    else:
+        data = result if state_def.get("Type") in ("Task", "Pass", "Map", "Parallel") else raw_input
+        if error_output is not None:
+            data = error_output
+        assigned = _resolve_params_obj(assign, data, ctx)
+    # All expressions see state-entry values, including assignments to peers.
+    variables.update(copy.deepcopy(assigned))
 
 
 def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_output=None):
@@ -3462,7 +3509,7 @@ def _eval_intrinsic_arg(arg, data, ctx):
         path = arg[1]
         if path.startswith("$$."):
             return _resolve_ctx_path(path, ctx or {})
-        return _resolve_path(path, data)
+        return _resolve_path_or_ctx(path, data, ctx)
     elif kind == "call":
         return _exec_intrinsic(arg, data, ctx)
     return None
@@ -3601,7 +3648,7 @@ def _resolve_params_obj(template, data, ctx=None):
                 elif value.startswith("$$."):
                     result[real_key] = _resolve_ctx_path(value, ctx or {})
                 else:
-                    result[real_key] = _resolve_path(value, data)
+                    result[real_key] = _resolve_path_or_ctx(value, data, ctx)
             else:
                 result[real_key] = value
         elif isinstance(value, dict):
@@ -4008,6 +4055,32 @@ def _poll_ecs_tasks(cluster, task_arns):
     raise _ExecutionError("States.Timeout", "ECS tasks did not complete in time")
 
 
+def _invoke_glue_start_job_run(resource, input_data):
+    """arn:aws:states:::glue:startJobRun[.sync]"""
+    result = _dispatch_aws_sdk_json(_AWS_SDK_SERVICE_MAP["glue"], "glue", "startJobRun", input_data)
+    if resource.rstrip("/").endswith(".sync"):
+        return _poll_glue_job_run(input_data["JobName"], result["JobRunId"])
+    # Step Functions adds the request's JobName to the StartJobRun response.
+    return {"JobName": input_data["JobName"], **result}
+
+
+def _poll_glue_job_run(job_name, run_id):
+    """Poll GetJobRun until the run ends. A run that does not succeed fails the task."""
+    while True:
+        # Not scaled: SFN_WAIT_SCALE=0 would turn the poll into a busy loop.
+        time.sleep(1)
+        job_run = _dispatch_aws_sdk_json(
+            _AWS_SDK_SERVICE_MAP["glue"], "glue", "getJobRun", {"JobName": job_name, "RunId": run_id})["JobRun"]
+        # The optimized integration gives timestamps as epoch milliseconds, not the aws-sdk ISO strings.
+        for field in ("StartedOn", "LastModifiedOn", "CompletedOn"):
+            if field in job_run:
+                job_run[field] = int(datetime.fromisoformat(job_run[field].replace("Z", "+00:00")).timestamp() * 1000)
+        if job_run["JobRunState"] == "SUCCEEDED":
+            return job_run
+        if job_run["JobRunState"] in ("FAILED", "ERROR", "TIMEOUT", "STOPPED"):
+            raise _ExecutionError("States.TaskFailed", json.dumps(job_run))
+
+
 def _pascal_to_camel(d):
     """Recursively convert PascalCase keys to camelCase for ECS internals."""
     if isinstance(d, list):
@@ -4064,6 +4137,7 @@ _AWS_SDK_SERVICE_MAP = {
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
     "route53": {"protocol": "rest-xml", "service_key": "route53"},
     "lambda": {"protocol": "rest"},
+    "scheduler": {"protocol": "rest"},
 }
 
 # Map lowercase service names used in aws-sdk ARNs to the PascalCase prefix
@@ -4094,6 +4168,7 @@ _AWS_SDK_ERROR_PREFIX = {
     "rdsdata": "RdsData",
     "s3": "S3",
     "lambda": "Lambda",
+    "scheduler": "Scheduler",
 }
 
 _AWS_SDK_ERROR_CODE_OVERRIDES = {
@@ -5086,6 +5161,147 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
     return output
 
 
+# EventBridge Scheduler REST routes: action -> (method, path, {member: querystring}).
+# The other members go in the JSON body for POST/PUT. Task output keeps the
+# Scheduler member names unchanged.
+_SCHEDULER_ROUTES = {
+    "CreateSchedule": ("POST", "/schedules/{Name}", {}),
+    "GetSchedule": ("GET", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "UpdateSchedule": ("PUT", "/schedules/{Name}", {}),
+    "DeleteSchedule": ("DELETE", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "ListSchedules": ("GET", "/schedules", {
+        "GroupName": "ScheduleGroup", "NamePrefix": "NamePrefix", "State": "State"}),
+    "CreateScheduleGroup": ("POST", "/schedule-groups/{Name}", {}),
+    "GetScheduleGroup": ("GET", "/schedule-groups/{Name}", {}),
+    "DeleteScheduleGroup": ("DELETE", "/schedule-groups/{Name}", {}),
+    "ListScheduleGroups": ("GET", "/schedule-groups", {"NamePrefix": "NamePrefix"}),
+}
+
+_SCHEDULER_TIMESTAMPS = ("CreationDate", "LastModificationDate", "StartDate", "EndDate")
+
+
+def _scheduler_timestamp_out(value):
+    """Epoch seconds as the ISO-8601 UTC string a task outputs (milliseconds only when non-zero)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    try:
+        millis = int(round(value * 1000))
+        text = datetime.fromtimestamp(millis // 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        # A number from Parameters outside the datetime range is shown as it was stored.
+        return value
+    if millis % 1000:
+        text += f".{millis % 1000:03d}"
+    return text + "Z"
+
+
+_SCHEDULER_TIMESTAMP_IN = re.compile(
+    r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:[0-5]\d)")
+
+
+def _scheduler_timestamp_in(value):
+    """An ISO-8601 timestamp string from Parameters as epoch seconds, cut to milliseconds."""
+    match = _SCHEDULER_TIMESTAMP_IN.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        return value
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
+    offset = timedelta(0)
+    if zone != "Z":
+        offset = timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6])) * (1 if zone[0] == "+" else -1)
+    try:
+        # An impossible date, an offset of a day or more, or an instant outside
+        # years 1-9999 in UTC is left for Scheduler.
+        parsed = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second),
+                          tzinfo=timezone(offset)).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return value
+    millis = int((fraction or "").ljust(3, "0")[:3])
+    return int(parsed.timestamp()) + millis / 1000
+
+
+def _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data):
+    """Dispatch the EventBridge Scheduler REST aws-sdk calls."""
+    from urllib.parse import quote
+
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    pascal_action = action[0].upper() + action[1:] if action else action
+    route = _SCHEDULER_ROUTES.get(pascal_action)
+    if route is None:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
+            "(scheduler dispatcher covers createSchedule, getSchedule, updateSchedule, "
+            "deleteSchedule, listSchedules, createScheduleGroup, getScheduleGroup, "
+            "deleteScheduleGroup, and listScheduleGroups)",
+        )
+    method, path, query_members = route
+
+    members = dict(input_data or {})
+    if "{Name}" in path:
+        path = path.replace("{Name}", quote(str(members.pop("Name", "")), safe=""))
+    query_params = {
+        wire: str(members.pop(member))
+        for member, wire in query_members.items()
+        if member in members
+    }
+    for member in ("StartDate", "EndDate"):
+        if member in members:
+            members[member] = _scheduler_timestamp_in(members[member])
+    target = members.get("Target")
+    if isinstance(target, dict) and isinstance(target.get("Input"), (dict, list)):
+        # Target.Input is a string member; a JSON object or array is sent as compact JSON text.
+        members["Target"] = {**target, "Input": json.dumps(
+            target["Input"], separators=(",", ":"), ensure_ascii=False)}
+    body = json.dumps(members).encode("utf-8") if method in ("POST", "PUT") else b""
+
+    # Same account and region as the execution; see _dispatch_aws_sdk_lambda_rest.
+    caller_account = get_account_id()
+    headers = {
+        "content-type": "application/json",
+        "host": f"{service_key}.{get_region()}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential={caller_account}/20260101/"
+            f"{get_region()}/{service_key}/aws4_request"
+        ),
+    }
+
+    status, _resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_params)
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+    if status >= 400:
+        try:
+            err_data = json.loads(decoded)
+            code = err_data.get("__type") or "ServiceException"
+            msg = err_data.get("Message") or decoded
+        except Exception:
+            code, msg = "ServiceException", decoded
+        raise _ExecutionError(
+            _prefix_sdk_error(service_name, code),
+            f"{msg} (Service: Scheduler, Status Code: {status}, Request ID: {new_uuid()}) "
+            "(SDK Attempt Count: 1)",
+        )
+
+    result = json.loads(decoded) if decoded else {}
+    records = [result]
+    for list_key in ("Schedules", "ScheduleGroups"):
+        records.extend(result.get(list_key) or [])
+    for record in records:
+        for member in _SCHEDULER_TIMESTAMPS:
+            if member in record:
+                record[member] = _scheduler_timestamp_out(record[member])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # REST-XML aws-sdk dispatch (S3)
 # ---------------------------------------------------------------------------
@@ -5501,6 +5717,8 @@ def _invoke_aws_sdk_integration(resource, input_data):
         return _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data)
     elif protocol == "rest" and service_name == "lambda":
         return _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data)
+    elif protocol == "rest" and service_name == "scheduler":
+        return _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data)
     else:
         raise _ExecutionError(
             "States.Runtime",
@@ -5545,6 +5763,7 @@ _SERVICE_DISPATCH = {
         "updateItem", d
     ),
     "arn:aws:states:::ecs:runTask": _invoke_ecs_run_task,
+    "arn:aws:states:::glue:startJobRun": _invoke_glue_start_job_run,
 }
 
 

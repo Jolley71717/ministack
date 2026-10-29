@@ -83,7 +83,7 @@ class Accounts:
         self.logs = _client("logs", CONSUMER)
         self._cleanup = []
         # A policy may only name principals that exist: the function's role, a
-        # second role, and a third account that is in use.
+        # second role, and a third account that holds an IAM user.
         iam = _client("iam", CONSUMER)
         for role in (ROLE_NAME, OTHER_ROLE_ARN.rsplit("/", 1)[1]):
             try:
@@ -94,7 +94,10 @@ class Accounts:
                 }))
             except iam.exceptions.EntityAlreadyExistsException:
                 pass
-        _client("sts", OTHER_ACCOUNT).get_caller_identity()
+        try:  # MiniStack knows an account once it holds an IAM identity
+            _client("iam", OTHER_ACCOUNT).create_user(UserName="xacct-other-account-user")
+        except ClientError:
+            pass
 
     def stream(self, client=None, shards=1, name=None):
         client = client or self.kin

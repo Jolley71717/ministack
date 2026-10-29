@@ -17,6 +17,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets as stdlib_secrets
 import string
 import time
@@ -136,8 +137,15 @@ def _resolve(secret_id, *, use_arn_scope=False):
         for key, s in candidates:
             if s["ARN"] == secret_id:
                 return key, s
+        # A partial ARN is the full ARN minus the "-XXXXXX" suffix that
+        # CreateSecret appends, so it must match exactly that and nothing
+        # longer. A bare prefix test also matched "my-secret-admin-XXXXXX"
+        # for "my-secret" and returned whichever was stored first.
+        suffix_len = len("-") + 6
         for key, s in candidates:
-            if s["ARN"].startswith(secret_id):
+            arn = s["ARN"]
+            if (len(arn) == len(secret_id) + suffix_len
+                    and arn.startswith(secret_id + "-")):
                 return key, s
         return None, None
     if secret_id in _secrets:
@@ -175,6 +183,50 @@ def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None
     if not ver:
         return None
     return ver.get("SecretString")
+
+
+def _resolve_for_reader(secret_id):
+    """``_resolve`` as Secrets Manager reads a SecretId for another service: an
+    ARN whose name ends in a hyphen and six letters, digits or underscores is
+    read as a full ARN, so it never matches as a partial one."""
+    key, secret = _resolve(secret_id)
+    if secret and secret_id.startswith("arn:") and secret["ARN"] != secret_id:
+        scope = _secret_scope_from_arn(secret_id)
+        if not scope or re.search(r"-[A-Za-z0-9_]{6}\Z", scope[1]):
+            return None, None
+    return key, secret
+
+
+def resolve_secret_version(secret_id, version_id):
+    """Return ``(secret, version)`` for the version *version_id* of
+    *secret_id*, ``(secret, None)`` when *version_id* is None or unknown, or
+    ``(None, None)``.
+
+    Used by AppConfig to read a deployed version in-process. Only the
+    caller's account and region are searched, and a secret scheduled for
+    deletion resolves to ``(None, None)``.
+    """
+    _, secret = _resolve_for_reader(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        return None, None
+    return secret, secret["Versions"].get(version_id)
+
+
+def find_secret(secret_id):
+    """The secret *secret_id* names in the caller's account and region,
+    whatever its state, or None."""
+    return _resolve_for_reader(secret_id)[1]
+
+
+def secret_exists(secret_id):
+    """True if *secret_id* (name, full or partial ARN) names a secret in the
+    caller's account and region that is not scheduled for deletion and has a
+    current value (a secret created without one has no version on AWS)."""
+    _, secret = _resolve_for_reader(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        return False
+    _, ver = _find_stage_version(secret, "AWSCURRENT")
+    return bool(ver) and (ver.get("SecretString") is not None or ver.get("SecretBinary") is not None)
 
 
 def create_secret_in_process(name, secret_string, description=""):

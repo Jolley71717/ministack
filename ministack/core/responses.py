@@ -62,18 +62,17 @@ def set_request_account_id(access_key_id: str) -> None:
     An STS session key resolves to the account of the role it assumed.
     Otherwise fall back to the MINISTACK_ACCOUNT_ID env var or 000000000000."""
     if access_key_id and _12_DIGIT_RE.match(access_key_id):
-        account_id = access_key_id
-    else:
-        assumed = _account_from_sts_session(access_key_id) if access_key_id else None
-        account_id = assumed or os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
-    _request_account_id.set(account_id)
-    _accounts_seen.add(account_id)
+        _request_account_id.set(access_key_id)
+        return
 
+    assumed = _account_from_sts_session(access_key_id) if access_key_id else None
+    if assumed:
+        _request_account_id.set(assumed)
+        return
 
-# Accounts a request has been signed for since start or the last reset. Any
-# 12-digit key is an account, so this is how MiniStack tells an account that
-# is in use from one that only appears in an ARN (see core/accounts.py).
-_accounts_seen: set[str] = set()
+    _request_account_id.set(
+        os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+    )
 
 
 def get_account_id() -> str:

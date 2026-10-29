@@ -3881,9 +3881,6 @@ def _reset_all_state():
         except Exception as e:
             logger.warning("reset() failed for %s: %s", mod_name, e)
 
-    from ministack.core import accounts
-    accounts.reset()
-
     S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
     S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
 
@@ -4026,6 +4023,8 @@ def main():
         config = HypercornConfig()
         config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75
+        # AWS closes client connections by time, not request count
+        config.keep_alive_max_requests = 10_000_000
         config.loglevel = LOG_LEVEL.upper()
 
         # USE_SSL=1 enables HTTPS — matches the behaviour previously provided
