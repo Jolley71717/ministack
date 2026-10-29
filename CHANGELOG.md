@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **KMS — keys in other accounts, missing keys and denials answer as AWS does** — another account's key named by key ARN or alias ARN, or by the ciphertext `Decrypt` is given, is now governed by its key policy in both auth modes. A refusal names the key when it exists and not when it does not; operations AWS does not serve across accounts answer `This operation cannot be called cross account`; another Region's ARN answers `Invalid arn <region>`. A key or alias that does not exist answers `NotFoundException` before any permission check, worded as AWS words it, and a denial no policy allows is HTTP 400 naming the key. `DescribeKey` carries `AWSAccountId`, `GetKeyRotationStatus` carries `KeyId` (and no period while rotation is off), and the default key policy has AWS's layout. Recorded with two accounts in us-east-1.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
