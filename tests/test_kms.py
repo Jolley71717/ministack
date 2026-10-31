@@ -1101,15 +1101,6 @@ def test_default_key_policy_hands_the_decision_to_identity_policies(auth_key):
 
 
 
-def test_identity_denial_names_the_key(auth_key):
-    """Recorded on AWS (us-east-1): a user without an identity policy is refused with HTTP 400, naming the key."""
-    key_id = auth_key()
-    access_key, user = inprocess_iam_user()
-    assert _kms_call(access_key, "GenerateDataKey", key_id, "message") == (400, (
-        f"User: {user} is not authorized to perform: kms:GenerateDataKey on resource: "
-        f"arn:aws:kms:us-east-1:000000000000:key/{key_id} because no identity-based policy allows the "
-        "kms:GenerateDataKey action"))
-
 def test_key_policy_deny_beats_an_identity_allow(auth_key):
     access_key, user = inprocess_iam_user(_ALLOW_KMS)
     key_id = auth_key(("Allow", "arn:aws:iam::000000000000:root", "kms:*"), ("Deny", user, "kms:GenerateDataKey"))
@@ -3021,6 +3012,23 @@ def test_kms_shapes_match_aws(kms_client):
     with pytest.raises(ClientError) as exc:
         kms_client.encrypt(KeyId="alias/never-made", Plaintext=b"x")
     assert exc.value.response["Error"]["Message"] == f"Alias arn:aws:kms:us-east-1:{account}:alias/never-made is not found."
+
+
+@pytest.mark.auth_contract
+def test_kms_identity_denial_names_the_key(auth_enabled, iam_user, kms_client):
+    """Recorded on AWS (us-east-1): a user without an identity policy is refused with HTTP 400, naming the key."""
+    key = kms_client.create_key()["KeyMetadata"]
+    user = iam_user()
+    client = user.client("kms")
+    if not auth_enabled:
+        assert "CiphertextBlob" in client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+        return
+    with pytest.raises(ClientError) as exc:
+        client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"] == {"Code": "AccessDeniedException", "Message": (
+        f"User: {user.arn} is not authorized to perform: kms:GenerateDataKey on resource: {key['Arn']} "
+        "because no identity-based policy allows the kms:GenerateDataKey action")}
 
 @pytest.mark.auth_contract
 def test_kms_key_arn_from_another_account(auth_enabled):
