@@ -506,6 +506,8 @@ SERVICE_REGISTRY = {
     "inspector2": {"module": "inspector2"},
     "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
+    "sagemaker": {"module": "sagemaker"},
+    "sagemaker-featurestore-runtime": {"module": "sagemaker_featurestore_runtime"},
     "bedrock": {"module": "bedrock"},
     "bedrock-runtime": {"module": "bedrock_runtime"},
     "bedrock-agent": {"module": "bedrock_agent"},

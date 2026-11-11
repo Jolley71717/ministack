@@ -104,6 +104,8 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "s3": "s3",
     "s3files": "s3",
     "s3tables": "s3tables",
+    "sagemaker": "sagemaker",
+    "sagemaker-featurestore-runtime": "sagemaker",
     "scheduler": "scheduler",
     "secretsmanager": "secretsmanager",
     "servicediscovery": "servicediscovery",
@@ -572,6 +574,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "route53": ["route53"],
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
+    "sagemaker-featurestore-runtime": ["sagemaker-featurestore-runtime"],
     "scheduler": ["scheduler"],
     "ses": ["sesv2"],  # the v2 REST API; v1 names its Action
     "signer": ["signer"],
@@ -1686,6 +1689,18 @@ def extract_resource_arn(service: str, method: str, path: str,
             if name.startswith("arn:"):
                 return name
             return f"arn:aws:cloudtrail:{region}:{account_id}:trail/{name}"
+        return "*"
+
+    if service in ("sagemaker", "sagemaker-featurestore-runtime"):
+        if service == "sagemaker":
+            name = _safe_json_field(body, "FeatureGroupName") or _safe_json_field(body, "ResourceArn")
+        else:
+            parts = [p for p in path.split("/") if p]
+            name = unquote(parts[1]) if len(parts) == 2 and parts[0] == "FeatureGroup" else ""
+        if name.startswith("arn:"):
+            return name
+        if name:
+            return f"arn:aws:sagemaker:{region}:{account_id}:feature-group/{name}"
         return "*"
 
     if service == "s3tables":

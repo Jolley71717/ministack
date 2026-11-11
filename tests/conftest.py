@@ -1012,6 +1012,16 @@ def budgets():
 
 
 @pytest.fixture(scope="session")
+def sagemaker():
+    return make_client("sagemaker")
+
+
+@pytest.fixture(scope="session")
+def featurestore():
+    return make_client("sagemaker-featurestore-runtime")
+
+
+@pytest.fixture(scope="session")
 def kinesisanalyticsv2():
     return make_client("kinesisanalyticsv2")
 

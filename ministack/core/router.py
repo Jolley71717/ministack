@@ -522,6 +522,16 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"cloudtrail\."],
         "credential_scope": "cloudtrail",
     },
+    "sagemaker": {
+        "target_prefixes": ["SageMaker."],
+        "host_patterns": [r"api\.sagemaker\."],
+        "credential_scope": "sagemaker",
+    },
+    # Feature Store Runtime also signs as `sagemaker` (botocore signingName),
+    # so detect_service tells it apart by host or by its REST paths.
+    "sagemaker-featurestore-runtime": {
+        "host_patterns": [r"featurestore-runtime\.sagemaker\."],
+    },
     "cur": {
         "target_prefixes": ["AWSOrigamiServiceGateway"],
         "host_patterns": [r"cur\."],
@@ -790,6 +800,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     or path.startswith("/async-invoke")):
                     return "bedrock-runtime"
                 return "bedrock"
+            if svc_name == "sagemaker":
+                if ("featurestore-runtime.sagemaker." in host or path == "/BatchGetRecord"
+                        or path.startswith("/FeatureGroup/")):
+                    return "sagemaker-featurestore-runtime"
+                return "sagemaker"
             if svc_name == "lambda" and _LAMBDA_MICROVM_PATH_RE.match(path):
                 return "lambda-microvms"
             # Lambda Core also signs as `lambda`: endpointPrefix AND signingName
