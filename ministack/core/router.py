@@ -801,7 +801,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     return "bedrock-runtime"
                 return "bedrock"
             if svc_name == "sagemaker":
-                if ("featurestore-runtime.sagemaker." in host or path == "/BatchGetRecord"
+                if ("featurestore-runtime.sagemaker." in host or path in ("/BatchGetRecord", "/BatchWriteRecord")
                         or path.startswith("/FeatureGroup/")):
                     return "sagemaker-featurestore-runtime"
                 return "sagemaker"

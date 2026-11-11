@@ -253,11 +253,11 @@ def _describe_feature_group(payload):
     return _ok(dict(sorted(_public(group).items())))
 
 
-def _encode_token(offset):
+def encode_token(offset):
     return base64.b64encode(json.dumps({"offset": offset}).encode()).decode()
 
 
-def _decode_token(token):
+def decode_token(token):
     try:
         offset = json.loads(base64.b64decode(token, validate=True))["offset"]
     except (ValueError, KeyError, TypeError):
@@ -283,7 +283,7 @@ def _list_feature_groups(payload):
 
     start = 0
     if payload.get("NextToken"):
-        start = _decode_token(payload["NextToken"])
+        start = decode_token(payload["NextToken"])
         if start is None:
             return _validation("Validation Error: Pagination token is invalid. Please provide a valid token.")
     limit = int(payload.get("MaxResults") or 10)
@@ -293,7 +293,7 @@ def _list_feature_groups(payload):
         for g in page
     ]}
     if start + limit < len(groups):
-        body["NextToken"] = _encode_token(start + limit)
+        body["NextToken"] = encode_token(start + limit)
     return _ok(body)
 
 
@@ -320,8 +320,9 @@ def _update_feature_group(payload):
         group["_Metadata"][d["FeatureName"]] = {"CreationTime": now, "LastModifiedTime": now, "Parameters": {}}
     if online_cfg is not None:
         store = group.setdefault("OnlineStoreConfig", {"EnableOnlineStore": True})
-        if "TtlDuration" in online_cfg:
-            store["TtlDuration"] = copy.deepcopy(online_cfg["TtlDuration"])
+        for key in ("TtlDuration", "StorageType"):
+            if key in online_cfg:
+                store[key] = copy.deepcopy(online_cfg[key])
     if throughput is not None:
         group["ThroughputConfig"].update(copy.deepcopy(throughput))
     group["LastModifiedTime"] = now

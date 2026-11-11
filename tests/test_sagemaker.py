@@ -490,3 +490,158 @@ def test_sagemaker_feature_store_authorization_contract(auth_enabled, iam_user, 
         with pytest.raises(ClientError) as exc:
             call()
         assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+# -- read path details ------------------------------------------------------------
+
+
+def test_featurestore_empty_string_and_unwritten_features(sagemaker, featurestore):
+    name = _create(sagemaker, FeatureDefinitions=_DEFS + [{"FeatureName": "label", "FeatureType": "String"}])
+    featurestore.put_record(FeatureGroupName=name, Record=_rec("e1", "100.0", label="", age="5"))
+    # "" is kept as a value; a feature that was never written is left out, not filled in.
+    got = featurestore.get_record(FeatureGroupName=name, RecordIdentifierValueAsString="e1",
+                                  FeatureNames=["label", "score"])
+    assert got["Record"] == [{"FeatureName": "label", "ValueAsString": ""}]
+
+
+@pytest.mark.parametrize("record_id", ["10.0.0.1-ab+c/d==", "ü ?&#%"], ids=["base64-ip", "reserved-chars"])
+def test_featurestore_record_identifier_characters(sagemaker, featurestore, record_id):
+    name = _create(sagemaker)
+    featurestore.put_record(FeatureGroupName=name, Record=_rec(record_id, "100.0"))
+    assert _values(featurestore.get_record(FeatureGroupName=name, RecordIdentifierValueAsString=record_id))[
+        "customer_id"] == record_id
+    if "+" in record_id:  # a "+" must not be read as a space
+        assert "Record" not in featurestore.get_record(FeatureGroupName=name,
+                                                       RecordIdentifierValueAsString=record_id.replace("+", " "))
+
+
+# -- feature-level writes and listing ------------------------------------------------
+
+
+def test_sagemaker_storage_type(sagemaker):
+    v2 = _create(sagemaker, OnlineStoreConfig={"EnableOnlineStore": True, "StorageType": "Standard_V2"})
+    assert sagemaker.describe_feature_group(FeatureGroupName=v2)["OnlineStoreConfig"] == {
+        "EnableOnlineStore": True, "StorageType": "Standard_V2"}
+    default = _create(sagemaker)
+    sagemaker.update_feature_group(FeatureGroupName=default, OnlineStoreConfig={"StorageType": "Standard_V2"})
+    assert sagemaker.describe_feature_group(FeatureGroupName=default)["OnlineStoreConfig"]["StorageType"] == \
+        "Standard_V2"
+
+
+def test_featurestore_update_record(sagemaker, featurestore):
+    standard = _create(sagemaker, OnlineStoreConfig={"EnableOnlineStore": True, "StorageType": "Standard"})
+    featurestore.put_record(FeatureGroupName=standard, Record=_rec("u1", "100.0", age="1"))
+    with pytest.raises(ClientError) as exc:
+        featurestore.update_record(FeatureGroupName=standard, RecordIdentifierValueAsString="u1",
+                                   Features=[{"FeatureName": "score", "ValueAsString": "0.5"}])
+    assert _error(exc) == ("ValidationError", "Validation Error: UpdateRecord is not supported for this storage "
+                           "type. Create a feature group with Standard_V2 or InMemory storage type to use "
+                           "feature-level writes.")
+
+    name = _create(sagemaker, OnlineStoreConfig={"EnableOnlineStore": True, "StorageType": "Standard_V2"})
+    featurestore.put_record(FeatureGroupName=name, Record=_rec("u1", "100.0", age="1"))
+    featurestore.update_record(FeatureGroupName=name, RecordIdentifierValueAsString="u1",
+                               Features=[{"FeatureName": "score", "ValueAsString": "0.5"}])
+    assert _values(featurestore.get_record(FeatureGroupName=name, RecordIdentifierValueAsString="u1")) == {
+        "customer_id": "u1", "event_time": "100.0", "age": "1", "score": "0.5"}
+    featurestore.update_record(FeatureGroupName=name, RecordIdentifierValueAsString="u1",
+                               Features=[{"FeatureName": "event_time", "ValueAsString": "200.0"},
+                                         {"FeatureName": "age", "ValueAsString": "2"}])
+    assert _values(featurestore.get_record(FeatureGroupName=name, RecordIdentifierValueAsString="u1")) == {
+        "customer_id": "u1", "event_time": "200.0", "age": "2", "score": "0.5"}
+
+    with pytest.raises(ClientError) as exc:
+        featurestore.update_record(FeatureGroupName=name, RecordIdentifierValueAsString="u1",
+                                   Features=[{"FeatureName": "event_time", "ValueAsString": "50.0"},
+                                             {"FeatureName": "age", "ValueAsString": "9"}])
+    assert _error(exc) == ("ConflictException", "Update rejected: the provided EventTime is older than the "
+                           "record's current EventTime. The record was not modified.")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+
+    with pytest.raises(ClientError) as exc:
+        featurestore.update_record(FeatureGroupName=name, RecordIdentifierValueAsString="nope",
+                                   Features=[{"FeatureName": "age", "ValueAsString": "1"}])
+    assert _error(exc) == ("ResourceNotFound", "Record Not Found: Record not found with record identifier [nope].")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    for features, message in (
+        ([{"FeatureName": "customer_id", "ValueAsString": "u9"}],
+         "Validation Error: The record identifier feature cannot be updated."),
+        ([{"FeatureName": "score", "ValueAsString": "x"}],
+         "Validation Error: Attempted to parse the feature value for the feature named [score] into a FeatureValue "
+         "of type Fractional. The provided value must be within the range of a double precision floating point "
+         "number defined by the IEEE 754 standard. The input format can be in either decimal form or scientific "
+         "notation."),
+    ):
+        with pytest.raises(ClientError) as exc:
+            featurestore.update_record(FeatureGroupName=name, RecordIdentifierValueAsString="u1", Features=features)
+        assert _error(exc) == ("ValidationError", message)
+    with pytest.raises(ClientError) as exc:
+        featurestore.update_record(FeatureGroupName=name, RecordIdentifierValueAsString="u1",
+                                   Features=[{"FeatureName": "age", "ValueAsString": "3"}],
+                                   TtlDuration={"Unit": "Days", "Value": 1})
+    assert _error(exc) == ("ValidationError", "Validation Error: EventTime is required when TtlDuration is "
+                           "specified or when the feature group has a default TTL configured. Include the EventTime "
+                           "feature in the Features list.")
+
+
+def test_featurestore_batch_write_record(sagemaker, featurestore):
+    name = _create(sagemaker)
+    other = _create(sagemaker)
+    assert featurestore.batch_write_record(Entries=[
+        {"FeatureGroupName": name, "Record": _rec("w1", "100.0", age="1")},
+        {"FeatureGroupName": other, "Record": _rec("w2", "100.0")},
+    ])["Errors"] == []
+    assert _values(featurestore.get_record(FeatureGroupName=name, RecordIdentifierValueAsString="w1"))["age"] == "1"
+
+    # A missing group, an unknown feature or a missing required feature fails only that entry.
+    got = featurestore.batch_write_record(Entries=[
+        {"FeatureGroupName": "fs-test-absent", "Record": _rec("m1", "100.0")},
+        {"FeatureGroupName": name, "Record": _rec("n1", "100.0") + [{"FeatureName": "zz", "ValueAsString": "1"}]},
+        {"FeatureGroupName": name, "Record": [{"FeatureName": "event_time", "ValueAsString": "100.0"}]},
+        {"FeatureGroupName": name, "Record": _rec("ok", "100.0")},
+    ])
+    assert [e["ErrorMessage"] for e in got["Errors"]] == [
+        "Resource Not Found: Amazon SageMaker can't find a FeatureGroup with name "
+        "[arn:aws:sagemaker:us-east-1:000000000000:feature-group/fs-test-absent].",
+        f"Validation Error: Provided values for Feature(s) contain invalid entries which don't exist in "
+        f"FeatureGroup [{name}].",
+        "Validation Error: Provided Record doesn't contain a required FeatureValue. Provide a FeatureValue with the "
+        "name [customer_id].",
+    ]
+    assert got["Errors"][0]["Entry"]["FeatureGroupName"] == "fs-test-absent"
+    assert "Record" in featurestore.get_record(FeatureGroupName=name, RecordIdentifierValueAsString="ok")
+
+    # A bad value or a repeated identifier rejects the whole request.
+    for entries, message in (
+        ([{"FeatureGroupName": name, "Record": _rec("q1", "100.0", age="x")},
+          {"FeatureGroupName": name, "Record": _rec("q2", "100.0")}],
+         "Validation Error: Attempted to parse the feature value for the feature named [age] into a FeatureValue of "
+         "type Integral. The provided value must be within the range of a 64 bit signed integer."),
+        ([{"FeatureGroupName": name, "Record": _rec("r1", "100.0")},
+          {"FeatureGroupName": name, "Record": _rec("r1", "100.0")}],
+         f"Validation Error: Duplicate record identifier 'r1' found in feature group '{name}'. Each record within a "
+         "feature group must have a unique record identifier."),
+    ):
+        with pytest.raises(ClientError) as exc:
+            featurestore.batch_write_record(Entries=entries)
+        assert _error(exc) == ("ValidationError", message)
+    for rid in ("q2", "r1"):
+        assert "Record" not in featurestore.get_record(FeatureGroupName=name, RecordIdentifierValueAsString=rid)
+
+
+def test_featurestore_list_records(sagemaker, featurestore):
+    name = _create(sagemaker)
+    for rid in ("a", "b", "c"):
+        featurestore.put_record(FeatureGroupName=name, Record=_rec(rid, "100.0"))
+    featurestore.delete_record(FeatureGroupName=name, RecordIdentifierValueAsString="b", EventTime="200.0")
+    assert sorted(featurestore.list_records(FeatureGroupName=name)["RecordIdentifiers"]) == ["a", "c"]
+    assert sorted(featurestore.list_records(FeatureGroupName=name, IncludeSoftDeletedRecords=True)[
+        "RecordIdentifiers"]) == ["a", "b", "c"]
+    page = featurestore.list_records(FeatureGroupName=name, MaxResults=1)
+    rest = featurestore.list_records(FeatureGroupName=name, MaxResults=5, NextToken=page["NextToken"])
+    assert sorted(page["RecordIdentifiers"] + rest["RecordIdentifiers"]) == ["a", "c"]
+    assert "NextToken" not in rest
+    with pytest.raises(ClientError) as exc:
+        featurestore.list_records(FeatureGroupName=name, NextToken="garbage")
+    assert _error(exc) == ("ValidationError", "Invalid pagination token")

@@ -1695,8 +1695,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         if service == "sagemaker":
             name = _safe_json_field(body, "FeatureGroupName") or _safe_json_field(body, "ResourceArn")
         else:
-            parts = [p for p in path.split("/") if p]
-            name = unquote(parts[1]) if len(parts) == 2 and parts[0] == "FeatureGroup" else ""
+            name = ""
+            if path.startswith("/FeatureGroup/"):
+                name = re.sub(r"/(Record|ListRecords)$", "", unquote(path[len("/FeatureGroup/"):]))
         if name.startswith("arn:"):
             return name
         if name:
